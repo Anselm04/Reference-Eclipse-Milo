@@ -1,0 +1,153 @@
+/*
+ * Copyright (c) 2024 the Eclipse Milo Authors
+ *
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ */
+
+package org.eclipse.milo.opcua.sdk.server.events.conversions;
+
+import static org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.ubyte;
+import static org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.uint;
+import static org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.ulong;
+import static org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.ushort;
+
+import org.eclipse.milo.opcua.stack.core.OpcUaDataType;
+import org.eclipse.milo.opcua.stack.core.types.builtin.StatusCode;
+import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.UByte;
+import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.UInteger;
+import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.ULong;
+import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.UShort;
+import org.jspecify.annotations.NonNull;
+import org.jspecify.annotations.Nullable;
+
+final class Int64Conversions {
+
+  private Int64Conversions() {}
+
+  @NonNull
+  static Boolean int64ToBoolean(@NonNull Long l) {
+    return l != 0;
+  }
+
+  @Nullable
+  static UByte int64ToByte(@NonNull Long l) {
+    if (l >= 0 && l <= UByte.MAX_VALUE) {
+      return ubyte(l);
+    } else {
+      return null;
+    }
+  }
+
+  @NonNull
+  static Double int64ToDouble(@NonNull Long l) {
+    return l.doubleValue();
+  }
+
+  @NonNull
+  static Float int64ToFloat(@NonNull Long l) {
+    return l.floatValue();
+  }
+
+  @Nullable
+  static Short int64ToInt16(@NonNull Long l) {
+    if (l >= Short.MIN_VALUE && l <= Short.MAX_VALUE) {
+      return l.shortValue();
+    } else {
+      return null;
+    }
+  }
+
+  @Nullable
+  static Integer int64ToInt32(@NonNull Long l) {
+    if (l >= Integer.MIN_VALUE && l <= Integer.MAX_VALUE) {
+      return l.intValue();
+    } else {
+      return null;
+    }
+  }
+
+  @Nullable
+  static Byte int64ToSByte(@NonNull Long l) {
+    if (l >= Byte.MIN_VALUE && l <= Byte.MAX_VALUE) {
+      return l.byteValue();
+    } else {
+      return null;
+    }
+  }
+
+  @NonNull
+  static StatusCode int64ToStatusCode(@NonNull Long l) {
+    return new StatusCode(l);
+  }
+
+  @NonNull
+  static String int64ToString(@NonNull Long l) {
+    return l.toString();
+  }
+
+  @Nullable
+  static UShort int64ToUInt16(@NonNull Long l) {
+    if (l >= 0 && l <= UShort.MAX_VALUE) {
+      return ushort(l.intValue());
+    } else {
+      return null;
+    }
+  }
+
+  @Nullable
+  static UInteger int64ToUInt32(@NonNull Long l) {
+    if (l >= 0 && l <= UInteger.MAX_VALUE) {
+      return uint(l);
+    } else {
+      return null;
+    }
+  }
+
+  @Nullable
+  static ULong int64ToUInt64(@NonNull Long l) {
+    if (l >= 0) {
+      return ulong(l);
+    } else {
+      return null;
+    }
+  }
+
+  @Nullable
+  static Object convert(@Nullable Object o, OpcUaDataType targetType, boolean implicit) {
+    if (o instanceof Long l) {
+      return implicit ? implicitConversion(l, targetType) : explicitConversion(l, targetType);
+    } else {
+      return null;
+    }
+  }
+
+  @Nullable
+  static Object explicitConversion(@NonNull Long l, OpcUaDataType targetType) {
+    return switch (targetType) {
+      case Boolean -> int64ToBoolean(l);
+      case Byte -> int64ToByte(l);
+      case Int16 -> int64ToInt16(l);
+      case Int32 -> int64ToInt32(l);
+      case SByte -> int64ToSByte(l);
+      case StatusCode -> int64ToStatusCode(l);
+      case String -> int64ToString(l);
+      case UInt16 -> int64ToUInt16(l);
+      case UInt32 -> int64ToUInt32(l);
+      case UInt64 -> int64ToUInt64(l);
+      default -> implicitConversion(l, targetType);
+    };
+  }
+
+  @Nullable
+  static Object implicitConversion(@NonNull Long l, OpcUaDataType targetType) {
+    return switch (targetType) {
+      case Double -> int64ToDouble(l);
+      case Float -> int64ToFloat(l);
+      default -> null;
+    };
+  }
+}

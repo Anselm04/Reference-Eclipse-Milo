@@ -1,0 +1,227 @@
+/*
+ * Copyright (c) 2024 the Eclipse Milo Authors
+ *
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ */
+
+package org.eclipse.milo.opcua.stack.core.types.builtin.unsigned;
+
+import java.math.BigInteger;
+import org.jspecify.annotations.NonNull;
+
+/**
+ * The <code>unsigned long</code> type
+ *
+ * @author Lukas Eder
+ * @author Jens Nerche
+ * @author Ivan Sokolov
+ */
+public final class ULong extends UNumber implements Comparable<ULong> {
+
+  /** Generated UID */
+  private static final long serialVersionUID = -6821055240959745390L;
+
+  /** A constant holding the minimum value an <code>unsigned long</code> can have, 0. */
+  public static final BigInteger MIN_VALUE = BigInteger.ZERO;
+
+  /**
+   * A constant holding the maximum value an <code>unsigned long</code> can have, 2<sup>64</sup>-1.
+   */
+  public static final BigInteger MAX_VALUE = new BigInteger("18446744073709551615");
+
+  /**
+   * A constant holding the maximum value + 1 an <code>signed long</code> can have, 2<sup>63</sup>.
+   */
+  public static final BigInteger MAX_VALUE_LONG = new BigInteger("9223372036854775808");
+
+  /** A constant holding the minimum value an <code>unsigned long</code> can have as ULong, 0. */
+  public static final ULong MIN = valueOf(MIN_VALUE.longValue());
+
+  /**
+   * A constant holding the maximum value + 1 an <code>signed long</code> can have as ULong,
+   * 2<sup>63</sup>.
+   */
+  public static final ULong MAX = valueOf(MAX_VALUE);
+
+  /** The value modelling the content of this <code>unsigned long</code> */
+  private final long value;
+
+  /**
+   * Create an <code>unsigned long</code>
+   *
+   * @throws NumberFormatException If <code>value</code> does not contain a parsable <code>
+   *     unsigned long</code>.
+   */
+  public static ULong valueOf(String value) throws NumberFormatException {
+    return new ULong(value);
+  }
+
+  /**
+   * Create an <code>unsigned long</code> by masking it with <code>0xFFFFFFFFFFFFFFFF</code> i.e.
+   * <code>(long) -1</code> becomes <code>(uint) 18446744073709551615</code>
+   */
+  public static ULong valueOf(long value) {
+    return new ULong(value);
+  }
+
+  /**
+   * Create an <code>unsigned long</code>
+   *
+   * @throws NumberFormatException If <code>value</code> is not in the range of an <code>
+   *     unsigned long</code>
+   */
+  public static ULong valueOf(BigInteger value) throws NumberFormatException {
+    return new ULong(value);
+  }
+
+  public static int compare(long x, long y) {
+    x += Long.MIN_VALUE;
+    y += Long.MIN_VALUE;
+    return Long.compare(x, y);
+  }
+
+  /**
+   * Create an <code>unsigned long</code>
+   *
+   * @throws NumberFormatException If <code>value</code> is not in the range of an <code>
+   *     unsigned long</code>
+   */
+  private ULong(BigInteger value) throws NumberFormatException {
+    if (value.compareTo(MIN_VALUE) < 0 || value.compareTo(MAX_VALUE) > 0) {
+      throw new NumberFormatException();
+    } else {
+      this.value = value.longValue();
+    }
+  }
+
+  /**
+   * Create an <code>unsigned long</code> by masking it with <code>0xFFFFFFFFFFFFFFFF</code> i.e.
+   * <code>(long) -1</code> becomes <code>(uint) 18446744073709551615</code>
+   */
+  private ULong(long value) {
+    this.value = value;
+  }
+
+  /**
+   * Create an <code>unsigned long</code>
+   *
+   * @throws NumberFormatException If <code>value</code> does not contain a parsable <code>
+   *     unsigned long</code>.
+   */
+  private ULong(String value) throws NumberFormatException {
+    this.value = Long.parseUnsignedLong(value);
+  }
+
+  @Override
+  public int intValue() {
+    return (int) value;
+  }
+
+  @Override
+  public long longValue() {
+    return value;
+  }
+
+  @Override
+  public float floatValue() {
+    if (value < 0) {
+      // Halve the value so it fits the signed range, keeping the bit shifted out as a sticky bit so
+      // the conversion still sees a value that is not exactly halfway, then scale back by a power
+      // of two, which is exact. Masking the sign bit off and adding it back would round twice.
+      return ((float) ((value >>> 1) | (value & 1))) * 2.0f;
+    } else {
+      return value;
+    }
+  }
+
+  @Override
+  public double doubleValue() {
+    if (value < 0) {
+      // Halved and made sticky for the reason given in floatValue().
+      return ((double) ((value >>> 1) | (value & 1))) * 2.0;
+    } else {
+      return value;
+    }
+  }
+
+  @Override
+  public int hashCode() {
+    return Long.valueOf(value).hashCode();
+  }
+
+  @Override
+  public boolean equals(Object obj) {
+    if (obj instanceof ULong that) {
+      return value == that.value;
+    }
+
+    return false;
+  }
+
+  @Override
+  public String toString() {
+    if (value >= 0) {
+      return Long.toString(value);
+    } else {
+      return BigInteger.valueOf(value & Long.MAX_VALUE).add(MAX_VALUE_LONG).toString();
+    }
+  }
+
+  @Override
+  public int compareTo(@NonNull ULong o) {
+    return compare(value, o.value);
+  }
+
+  public ULong add(ULong val) throws NumberFormatException {
+    if (value < 0 && val.value < 0) {
+      throw new NumberFormatException();
+    }
+    final long result = value + val.value;
+    if ((value < 0 || val.value < 0) && result >= 0) {
+      throw new NumberFormatException();
+    }
+    return valueOf(result);
+  }
+
+  public ULong add(int val) throws NumberFormatException {
+    return add((long) val);
+  }
+
+  public ULong add(long val) throws NumberFormatException {
+    if (val < 0) {
+      // valueOf masks, so -Long.MIN_VALUE is 2^63 here rather than an overflow
+      return subtract(valueOf(-val));
+    }
+    final long result = value + val;
+    if (value < 0 && result >= 0) {
+      throw new NumberFormatException();
+    }
+    return valueOf(result);
+  }
+
+  public ULong subtract(final ULong val) {
+    if (this.compareTo(val) < 0) {
+      throw new NumberFormatException();
+    }
+    return valueOf(value - val.value);
+  }
+
+  public ULong subtract(final int val) {
+    return subtract((long) val);
+  }
+
+  public ULong subtract(final long val) {
+    if (val < 0) {
+      // valueOf masks, so -Long.MIN_VALUE is 2^63 here rather than an overflow
+      return add(valueOf(-val));
+    }
+    if (compare(value, val) < 0) {
+      throw new NumberFormatException();
+    }
+    return valueOf(value - val);
+  }
+}

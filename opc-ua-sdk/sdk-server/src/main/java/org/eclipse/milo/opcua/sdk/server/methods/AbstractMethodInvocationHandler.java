@@ -1,0 +1,650 @@
+/*
+ * Copyright (c) 2025 the Eclipse Milo Authors
+ *
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ */
+
+package org.eclipse.milo.opcua.sdk.server.methods;
+
+import static java.util.Objects.requireNonNullElse;
+
+import java.lang.reflect.Array;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import org.eclipse.milo.opcua.sdk.core.ValueRanks;
+import org.eclipse.milo.opcua.sdk.core.typetree.DataType;
+import org.eclipse.milo.opcua.sdk.core.typetree.DataTypeTree;
+import org.eclipse.milo.opcua.sdk.server.AccessContext;
+import org.eclipse.milo.opcua.sdk.server.AddressSpace.CallContext;
+import org.eclipse.milo.opcua.sdk.server.CallOperationDiagnostics;
+import org.eclipse.milo.opcua.sdk.server.OpcUaServer;
+import org.eclipse.milo.opcua.sdk.server.Session;
+import org.eclipse.milo.opcua.sdk.server.nodes.UaMethodNode;
+import org.eclipse.milo.opcua.stack.core.Diagnostic;
+import org.eclipse.milo.opcua.stack.core.NodeIds;
+import org.eclipse.milo.opcua.stack.core.StatusCodes;
+import org.eclipse.milo.opcua.stack.core.UaException;
+import org.eclipse.milo.opcua.stack.core.UaSerializationException;
+import org.eclipse.milo.opcua.stack.core.encoding.DataTypeCodec;
+import org.eclipse.milo.opcua.stack.core.types.UaStructuredType;
+import org.eclipse.milo.opcua.stack.core.types.builtin.DiagnosticInfo;
+import org.eclipse.milo.opcua.stack.core.types.builtin.ExtensionObject;
+import org.eclipse.milo.opcua.stack.core.types.builtin.Matrix;
+import org.eclipse.milo.opcua.stack.core.types.builtin.NodeId;
+import org.eclipse.milo.opcua.stack.core.types.builtin.StatusCode;
+import org.eclipse.milo.opcua.stack.core.types.builtin.Variant;
+import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.UInteger;
+import org.eclipse.milo.opcua.stack.core.types.structured.Argument;
+import org.eclipse.milo.opcua.stack.core.types.structured.CallMethodRequest;
+import org.eclipse.milo.opcua.stack.core.types.structured.CallMethodResult;
+import org.eclipse.milo.opcua.stack.core.util.ArrayUtil;
+import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * A partial implementation of {@link MethodInvocationHandler} that validates input argument counts,
+ * shapes and data types before invoking application code.
+ *
+ * <p>Callers are responsible for access checks. Normal server Method dispatch applies the
+ * configured access controller before invoking this handler.
+ */
+public abstract class AbstractMethodInvocationHandler implements MethodInvocationHandler {
+
+  private static final Logger LOGGER =
+      LoggerFactory.getLogger(AbstractMethodInvocationHandler.class);
+
+  private final UaMethodNode node;
+
+  /**
+   * @param node the {@link UaMethodNode} this handler will be installed on.
+   */
+  public AbstractMethodInvocationHandler(UaMethodNode node) {
+    this.node = node;
+  }
+
+  public UaMethodNode getNode() {
+    return node;
+  }
+
+  /**
+   * Validate the inputs of {@code request}, then call {@link #invokeResult}.
+   *
+   * <p>When {@code accessContext} is the {@link CallContext} of a Call request, the diagnostics of
+   * the outcome are reported to its {@link CallOperationDiagnostics}: the diagnostic of a thrown
+   * {@link UaException} or of the returned {@link MethodResult} for the operation, and those of an
+   * {@link InvalidArgumentException} for its input arguments. Otherwise they are dropped.
+   *
+   * @param accessContext the {@link AccessContext}; a {@link CallContext} during a Call request.
+   * @param request the {@link CallMethodRequest}.
+   * @return the {@link CallMethodResult}.
+   */
+  @Override
+  public final CallMethodResult invoke(AccessContext accessContext, CallMethodRequest request) {
+    // Defensive copy: values for structure-typed arguments may be substituted with their
+    // decoded values below, and the request's array should not be modified.
+    Variant[] inputArgumentValues =
+        requireNonNullElse(request.getInputArguments(), new Variant[0]).clone();
+
+    CallOperationDiagnostics diagnostics =
+        accessContext instanceof CallContext callContext
+            ? callContext.getOperationDiagnostics()
+            : CallOperationDiagnostics.none();
+
+    CallMethodResult result;
+    @Nullable Diagnostic diagnostic = null;
+    List<@Nullable Diagnostic> argumentDiagnostics = List.of();
+
+    try {
+      // Read the metadata once so the count check and the loop below see the same Arguments.
+      Argument[] inputArguments = getInputArguments();
+      int requiredCount = getRequiredInputArgumentCount(inputArguments);
+      if (requiredCount < 0 || requiredCount > inputArguments.length) {
+        throw new UaException(StatusCodes.Bad_InternalError, "Invalid required input count");
+      }
+      if (inputArgumentValues.length < requiredCount) {
+        throw new UaException(StatusCodes.Bad_ArgumentsMissing);
+      }
+      if (inputArgumentValues.length > inputArguments.length) {
+        throw new UaException(StatusCodes.Bad_TooManyArguments);
+      }
+
+      StatusCode[] inputDataTypeCheckResults = new StatusCode[inputArgumentValues.length];
+
+      for (int i = 0; i < inputArgumentValues.length; i++) {
+        Argument argument = inputArguments[i];
+
+        Variant variant = inputArgumentValues[i];
+        Object value = variant.value();
+
+        if (value instanceof Matrix matrix && matrix.isNull()) {
+          // A null Matrix is just a null value; deliver it as one.
+          inputArgumentValues[i] = Variant.NULL_VALUE;
+          value = null;
+        }
+
+        // Check the shape first; it is cheap and avoids decoding elements of a mismatched value.
+        boolean dataTypeMatch = shapeMatches(argument, value);
+
+        if (dataTypeMatch && value != null) {
+          NodeId argDataTypeId = argument.getDataType();
+
+          DataTypeTree dataTypeTree = node.getNodeContext().getServer().getDataTypeTree();
+
+          boolean argIsStructType =
+              NodeIds.Structure.equals(argDataTypeId) || dataTypeTree.isStructType(argDataTypeId);
+
+          if (dataTypeTree.getBackingClass(argDataTypeId) == Variant.class) {
+            // Variant-backed declarations accept payload types, not just the wrapper class.
+            // Check Matrix elements without replacing the original representation.
+            try {
+              Variant.of(elementsOf(value));
+            } catch (IllegalArgumentException | ClassCastException e) {
+              dataTypeMatch = false;
+            }
+          } else if (argIsStructType) {
+            try {
+              if (value instanceof ExtensionObject xo) {
+                UaStructuredType decoded = decodeStructure(xo);
+
+                dataTypeMatch = structureTypeMatches(dataTypeTree, argDataTypeId, decoded);
+
+                if (dataTypeMatch) {
+                  // Substitute the decoded value so implementations receive the
+                  // UaStructuredType rather than the raw ExtensionObject.
+                  inputArgumentValues[i] = new Variant(decoded);
+                }
+              } else if (value instanceof ExtensionObject[] xos) {
+                UaStructuredType[] decodedElements =
+                    decodeMatchingStructures(dataTypeTree, argDataTypeId, xos);
+
+                dataTypeMatch = decodedElements != null;
+
+                if (dataTypeMatch) {
+                  // Substitute a correctly-typed array of the decoded values, so that e.g. an
+                  // argument of DataType XVType is delivered as XVType[], even when empty.
+                  inputArgumentValues[i] =
+                      new Variant(typedStructArray(argDataTypeId, decodedElements));
+                }
+              } else if (value instanceof UaStructuredType structValue) {
+                dataTypeMatch = structureTypeMatches(dataTypeTree, argDataTypeId, structValue);
+              } else {
+                // Validate each element without changing the value passed to subclasses.
+                dataTypeMatch =
+                    structureElementsMatch(dataTypeTree, argDataTypeId, elementsOf(value));
+              }
+            } catch (UaSerializationException e) {
+              dataTypeMatch = false;
+            }
+          } else {
+            NodeId valueDataTypeId =
+                variant
+                    .getDataTypeId()
+                    .flatMap(xni -> xni.toNodeId(node.getNodeContext().getNamespaceTable()))
+                    .orElse(NodeId.NULL_VALUE);
+
+            if (!argDataTypeId.equals(valueDataTypeId)) {
+              Class<?> elementType = ArrayUtil.getBoxedType(elementsOf(value));
+              dataTypeMatch = dataTypeTree.isAssignable(argDataTypeId, elementType);
+            }
+          }
+        }
+
+        if (dataTypeMatch) {
+          inputArgumentValues[i] = restoreMatrixRank(argument, inputArgumentValues[i]);
+          inputDataTypeCheckResults[i] = StatusCode.GOOD;
+        } else {
+          inputDataTypeCheckResults[i] = new StatusCode(StatusCodes.Bad_TypeMismatch);
+        }
+      }
+
+      if (Arrays.stream(inputDataTypeCheckResults).anyMatch(StatusCode::isBad)) {
+        throw new InvalidArgumentException(inputDataTypeCheckResults);
+      }
+
+      validateInputArgumentValues(inputArgumentValues);
+
+      InvocationContext invocationContext =
+          new InvocationContext() {
+            @Override
+            public OpcUaServer getServer() {
+              return node.getNodeContext().getServer();
+            }
+
+            @Override
+            public NodeId getObjectId() {
+              return request.getObjectId();
+            }
+
+            @Override
+            public UaMethodNode getMethodNode() {
+              return node;
+            }
+
+            @Override
+            public Optional<Session> getSession() {
+              return accessContext.getSession();
+            }
+          };
+
+      MethodResult methodResult = invokeResult(invocationContext, inputArgumentValues);
+
+      if (methodResult != null) {
+        result =
+            new CallMethodResult(
+                methodResult.getStatusCode(),
+                new StatusCode[0],
+                new DiagnosticInfo[0],
+                methodResult.outputArgumentsForResponse());
+
+        diagnostic = methodResult.getDiagnostic().orElse(null);
+      } else {
+        result = null;
+      }
+    } catch (InvalidArgumentException e) {
+      result =
+          new CallMethodResult(
+              e.getStatusCode(),
+              e.getInputArgumentResults(),
+              new DiagnosticInfo[0],
+              new Variant[0]);
+
+      diagnostic = e.getDiagnostic().orElse(null);
+      argumentDiagnostics = e.getInputArgumentDiagnostics();
+    } catch (UaException e) {
+      e.getDiagnostic().ifPresent(d -> diagnostics.report(request, d));
+
+      return failure(e.getStatusCode());
+    }
+
+    String problem = problemWith(result, inputArgumentValues.length, argumentDiagnostics.size());
+    if (problem != null) {
+      LOGGER.warn("Invalid result for methodId={}: {}", node.getNodeId(), problem);
+      return failure(new StatusCode(StatusCodes.Bad_InternalError));
+    }
+
+    if (diagnostic != null) {
+      diagnostics.report(request, diagnostic);
+    }
+    if (!argumentDiagnostics.isEmpty()) {
+      diagnostics.reportArguments(request, argumentDiagnostics);
+    }
+
+    return result;
+  }
+
+  /**
+   * Check {@code result} against the CallMethodResult rules in OPC 10000-4, 5.12.2.2: a Bad status
+   * carries no outputs, and input argument results are populated only for Bad_InvalidArgument, one
+   * per supplied input. Argument diagnostics, when present, are also one per supplied input.
+   *
+   * @return a description of the first rule {@code result} breaks, or {@code null} if it is valid.
+   */
+  private static @Nullable String problemWith(
+      @Nullable CallMethodResult result, int inputCount, int diagnostics) {
+
+    if (result == null || result.getStatusCode() == null) {
+      return "null result or status";
+    }
+    StatusCode status = result.getStatusCode();
+    int results = lengthOf(result.getInputArgumentResults());
+    int outputs = lengthOf(result.getOutputArguments());
+
+    if (status.isBad() && outputs != 0) {
+      return "Bad status with output arguments";
+    }
+    if (results != 0 && status.getValue() != StatusCodes.Bad_InvalidArgument) {
+      return "input argument results with a status other than Bad_InvalidArgument";
+    }
+    if (results != 0 && results != inputCount) {
+      return results + " input argument results for " + inputCount + " inputs";
+    }
+    if (diagnostics != 0 && diagnostics != inputCount) {
+      return diagnostics + " input argument diagnostics for " + inputCount + " inputs";
+    }
+    return null;
+  }
+
+  private static int lengthOf(Object @Nullable [] array) {
+    return array == null ? 0 : array.length;
+  }
+
+  private static CallMethodResult failure(StatusCode statusCode) {
+    return new CallMethodResult(
+        statusCode, new StatusCode[0], new DiagnosticInfo[0], new Variant[0]);
+  }
+
+  /** The flat elements of a Matrix, or {@code value} itself for any other value. */
+  private static @Nullable Object elementsOf(@Nullable Object value) {
+    return value instanceof Matrix matrix ? matrix.getElements() : value;
+  }
+
+  // Part 3, 8.6: ArrayDimensions specifies maxima; zero means unknown.
+  private static boolean shapeMatches(Argument argument, @Nullable Object value) {
+    if (value == null) {
+      return true;
+    }
+
+    // ByteString and String have scalar semantics, i.e. rank -1.
+    int rank =
+        value instanceof Matrix matrix ? matrix.getValueRank() : ArrayUtil.getValueRank(value);
+    int valueRank = argument.getValueRank();
+    boolean emptyArray = isEmptyArray(value);
+    boolean rankMatches =
+        switch (valueRank) {
+          case ValueRanks.ScalarOrOneDimension -> rank == ValueRanks.Scalar || rank == 1;
+          case ValueRanks.Any -> true;
+          case ValueRanks.Scalar -> rank == ValueRanks.Scalar;
+          case ValueRanks.OneOrMoreDimensions -> rank >= 1;
+          default -> valueRank > 0 && (rank == valueRank || emptyArray);
+        };
+    if (!rankMatches) {
+      return false;
+    }
+
+    UInteger[] maxima = argument.getArrayDimensions();
+    // An empty array has no element to exceed a maximum, and its single dimension does not line up
+    // with the dimensions declared for a higher rank.
+    if (valueRank > 0 && !emptyArray && maxima != null && maxima.length > 0) {
+      int[] dimensions =
+          value instanceof Matrix matrix ? matrix.getDimensions() : ArrayUtil.getDimensions(value);
+      if (maxima.length != dimensions.length) {
+        return false;
+      }
+      for (int i = 0; i < dimensions.length; i++) {
+        long maximum = maxima[i].longValue();
+        if (maximum != 0 && dimensions[i] > maximum) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Whether {@code value} is a zero-length one-dimensional array, the form an empty value of any
+   * rank arrives in.
+   *
+   * <p>OPC 10000-6, 5.2.2.16 and 5.3.1.17 carry an empty Matrix as an empty array with no
+   * ArrayDimensions, so an empty value has no rank of its own on the wire.
+   */
+  private static boolean isEmptyArray(@Nullable Object value) {
+    return value != null && ArrayUtil.getValueRank(value) == 1 && Array.getLength(value) == 0;
+  }
+
+  /**
+   * Give an empty value supplied for an Argument of ValueRank 2 or greater the Matrix
+   * representation its declared rank calls for, with a zero length in every dimension.
+   *
+   * @param argument the {@link Argument} the value was supplied for.
+   * @param variant the value supplied for {@code argument}.
+   * @return {@code variant}, or an empty {@link Matrix} of the Argument's declared rank.
+   */
+  private static Variant restoreMatrixRank(Argument argument, Variant variant) {
+    int valueRank = argument.getValueRank();
+    Object value = variant.value();
+
+    if (valueRank >= 2 && isEmptyArray(value)) {
+      return new Variant(new Matrix(value, new int[valueRank]));
+    } else {
+      return variant;
+    }
+  }
+
+  private @Nullable UaStructuredType decodeStructure(@Nullable ExtensionObject xo) {
+    if (xo == null || xo.isNull()) {
+      return null;
+    }
+    return xo.decode(node.getNodeContext().getServer().getStaticEncodingContext());
+  }
+
+  /**
+   * Decode each element of {@code xos} and check it against the Argument's DataType, stopping at
+   * the first mismatch.
+   *
+   * @return the decoded elements, or {@code null} if any element does not match.
+   */
+  private UaStructuredType @Nullable [] decodeMatchingStructures(
+      DataTypeTree dataTypeTree, NodeId argDataTypeId, ExtensionObject[] xos) {
+
+    var decodedElements = new UaStructuredType[xos.length];
+
+    for (int j = 0; j < xos.length; j++) {
+      decodedElements[j] = decodeStructure(xos[j]);
+
+      if (!structureTypeMatches(dataTypeTree, argDataTypeId, decodedElements[j])) {
+        return null;
+      }
+    }
+
+    return decodedElements;
+  }
+
+  /**
+   * Check that every element of a structure array matches the Argument's DataType. Null elements
+   * match; {@link ExtensionObject} elements are decoded first. Any other value does not match.
+   */
+  private boolean structureElementsMatch(
+      DataTypeTree dataTypeTree, NodeId argDataTypeId, @Nullable Object elements) {
+
+    if (elements instanceof ExtensionObject[] xos) {
+      return decodeMatchingStructures(dataTypeTree, argDataTypeId, xos) != null;
+    } else if (elements instanceof UaStructuredType[] structs) {
+      return Arrays.stream(structs)
+          .allMatch(s -> structureTypeMatches(dataTypeTree, argDataTypeId, s));
+    } else {
+      return false;
+    }
+  }
+
+  /**
+   * Check that a structure value's DataType matches the DataType of the {@link Argument} it was
+   * supplied for.
+   *
+   * <p>If the Argument's DataType is abstract the value's DataType may be any subtype of it;
+   * otherwise the DataTypes must match exactly.
+   *
+   * @param dataTypeTree the server's {@link DataTypeTree}.
+   * @param argDataTypeId the {@link NodeId} of the Argument's DataType.
+   * @param structValue the {@link UaStructuredType} value to check.
+   * @return {@code true} if {@code structValue}'s DataType matches the Argument's DataType.
+   */
+  private boolean structureTypeMatches(
+      DataTypeTree dataTypeTree, NodeId argDataTypeId, @Nullable UaStructuredType structValue) {
+
+    if (structValue == null) {
+      return true;
+    }
+
+    NodeId valueDataTypeId =
+        structValue
+            .getTypeId()
+            .toNodeId(node.getNodeContext().getNamespaceTable())
+            .orElse(NodeId.NULL_VALUE);
+
+    DataType argType = dataTypeTree.getType(argDataTypeId);
+    boolean isAbstract = argType != null && argType.isAbstract();
+
+    if (isAbstract) {
+      return dataTypeTree.isSubtypeOf(valueDataTypeId, argDataTypeId);
+    } else {
+      return Objects.equals(valueDataTypeId, argDataTypeId);
+    }
+  }
+
+  /**
+   * Create an array of the class registered for {@code argDataTypeId} containing {@code elements}.
+   *
+   * <p>Follows the {@code OpcUaBinaryDecoder#decodeStructArray} precedent: the element class comes
+   * from the registered {@link DataTypeCodec}, so even an empty array is correctly typed. If no
+   * codec is registered, e.g. because the DataType is abstract, the {@link UaStructuredType} array
+   * is returned as-is.
+   *
+   * @param argDataTypeId the {@link NodeId} of the Argument's DataType.
+   * @param elements the decoded {@link UaStructuredType} elements.
+   * @return an array of the codec's registered class containing {@code elements}.
+   */
+  private Object typedStructArray(NodeId argDataTypeId, UaStructuredType[] elements) {
+    DataTypeCodec codec =
+        node.getNodeContext()
+            .getServer()
+            .getStaticEncodingContext()
+            .getDataTypeManager()
+            .getCodec(argDataTypeId);
+
+    if (codec == null) {
+      return elements;
+    }
+
+    Object array = Array.newInstance(codec.getType(), elements.length);
+
+    for (int i = 0; i < elements.length; i++) {
+      Array.set(array, i, elements[i]);
+    }
+
+    return array;
+  }
+
+  /**
+   * Get the input {@link Argument}s expected by the Method this handler is installed on.
+   *
+   * @return the input {@link Argument}s expected by the Method this handler is installed on.
+   */
+  public abstract Argument[] getInputArguments();
+
+  /**
+   * Get the output {@link Argument}s expected by the Method this handler is installed on.
+   *
+   * @return the output {@link Argument}s expected by the Method this handler is installed on.
+   */
+  public abstract Argument[] getOutputArguments();
+
+  /**
+   * Get the number of leading inputs a caller must supply; any inputs after them are optional.
+   *
+   * <p>The default requires every declared input. Override this to accept calls that omit trailing
+   * inputs. Omitted inputs are absent from the array passed to {@link #invokeResult}, whereas a
+   * supplied null value keeps its position. A count outside the valid range fails the call with
+   * Bad_InternalError before any application code runs.
+   *
+   * @param inputArguments the input {@link Argument}s this call is validated against; do not
+   *     modify.
+   * @return a count between zero and {@code inputArguments.length}, inclusive.
+   */
+  protected int getRequiredInputArgumentCount(Argument[] inputArguments) {
+    return inputArguments.length;
+  }
+
+  /**
+   * Invoke this Method with its validated inputs and return the complete result.
+   *
+   * <p>The default delegates to {@link #invoke(InvocationContext, Variant[])} and reports Good.
+   * Override this to return a different status, for example Uncertain with outputs, or to explain
+   * the status with a diagnostic:
+   *
+   * <pre>{@code
+   * protected MethodResult invokeResult(InvocationContext context, Variant[] inputs) {
+   *   double requested = (Double) inputs[0].value();
+   *   double applied = Math.min(requested, MAX_SETPOINT);
+   *
+   *   if (applied < requested) {
+   *     StatusCode clamped = new StatusCode(StatusCodes.Uncertain_EngineeringUnitsExceeded);
+   *     Diagnostic diagnostic = Diagnostic.text("Setpoint clamped to " + MAX_SETPOINT);
+   *
+   *     return MethodResult.uncertain(clamped, new Variant(applied)).withDiagnostic(diagnostic);
+   *   }
+   *
+   *   return MethodResult.good(new Variant(applied));
+   * }
+   * }</pre>
+   *
+   * <p>Throw an {@link InvalidArgumentException} to reject individual input arguments, or a {@link
+   * UaException} to fail the call; a diagnostic either carries is returned to the client. A null
+   * result, or an {@link InvalidArgumentException} with a result or diagnostic count other than the
+   * number of supplied inputs, is logged and reported as Bad_InternalError.
+   *
+   * @param context the {@link InvocationContext}.
+   * @param suppliedValues the supplied inputs, validated and decoded as described by {@link
+   *     #invoke(InvocationContext, Variant[])}. Omitted optional inputs are absent, not padded.
+   * @return the complete result.
+   * @throws UaException if invocation fails; its status is reported without outputs.
+   */
+  protected MethodResult invokeResult(InvocationContext context, Variant[] suppliedValues)
+      throws UaException {
+
+    return MethodResult.good(invoke(context, suppliedValues));
+  }
+
+  /**
+   * Invoke this method and return the values for its output arguments, if any.
+   *
+   * <p>Input arguments have already passed shape, data type and application value validation.
+   * Callers remain responsible for access checks.
+   *
+   * @param invocationContext the {@link InvocationContext}.
+   * @param inputValues the user-supplied values for the input arguments. Each value has been
+   *     verified to be of the type specified by its {@link Argument}. Values for arguments with a
+   *     structured DataType carry the decoded {@link UaStructuredType} value (or, for array
+   *     arguments, an array of the DataType's registered class, e.g. {@code XVType[]}) rather than
+   *     the raw {@link ExtensionObject}(s) received in the request. A null ExtensionObject, whether
+   *     scalar or an array element, is delivered as {@code null}. Matrix arguments retain their
+   *     original representation; their elements are decoded only for validation. An empty value for
+   *     an argument of ValueRank 2 or greater is delivered as an empty {@link Matrix} of the
+   *     declared rank, because its wire form carries no dimensions.
+   * @return this output values matching this Method's output arguments, if any.
+   * @throws UaException if invocation has failed for some reason.
+   */
+  protected Variant[] invoke(InvocationContext invocationContext, Variant[] inputValues)
+      throws UaException {
+    throw new UaException(StatusCodes.Bad_NotImplemented);
+  }
+
+  /**
+   * Validate the input values against the expected input arguments.
+   *
+   * <p>The DataType of each input value has already been verified; implementations need only verify
+   * the value is "valid", if applicable, and throw InvalidArgumentException with a StatusCode of
+   * Bad_OutOfRange for any invalid input values.
+   *
+   * @param inputArgumentValues the input values provided by the client for the current method call.
+   *     Values for arguments with a structured DataType carry decoded {@link UaStructuredType}
+   *     values rather than raw {@link ExtensionObject}s.
+   * @throws InvalidArgumentException if one or more input argument values are invalid.
+   */
+  protected void validateInputArgumentValues(Variant[] inputArgumentValues)
+      throws InvalidArgumentException {}
+
+  /**
+   * Extends {@link AccessContext} to provide additional context to implementations of {@link
+   * AbstractMethodInvocationHandler}.
+   */
+  public interface InvocationContext extends AccessContext {
+
+    /**
+     * Get the {@link OpcUaServer} instance.
+     *
+     * @return the {@link OpcUaServer} instance.
+     */
+    OpcUaServer getServer();
+
+    /**
+     * Get the {@link NodeId} of the ObjectNode the method being invoked belongs to.
+     *
+     * @return the {@link NodeId} of the ObjectNode the method being invoked belongs to.
+     */
+    NodeId getObjectId();
+
+    /**
+     * Get the {@link UaMethodNode} being invoked.
+     *
+     * @return the {@link UaMethodNode} being invoked.
+     */
+    UaMethodNode getMethodNode();
+  }
+}

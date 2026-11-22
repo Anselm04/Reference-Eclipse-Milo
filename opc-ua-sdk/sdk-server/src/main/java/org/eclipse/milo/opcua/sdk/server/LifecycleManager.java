@@ -1,0 +1,189 @@
+/*
+ * Copyright (c) 2024 the Eclipse Milo Authors
+ *
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ */
+
+package org.eclipse.milo.opcua.sdk.server;
+
+import com.google.common.collect.Lists;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+/**
+ * A {@link Lifecycle} instance that manages the startup and shutdown of a collection of
+ * sub-Lifecycles.
+ *
+ * <p>Registered Lifecycles are started when this {@link LifecycleManager} is started and shutdown
+ * when this LifecycleManager is shutdown.
+ *
+ * <p>The order that sub-Lifecycles are shutdown can be controlled with the optional {@link
+ * ShutdownOrder} parameter provided in {@link LifecycleManager#LifecycleManager(ShutdownOrder)}.
+ *
+ * <p>If a child fails during startup, successfully started children are shut down in reverse order.
+ * Cleanup failures are suppressed on the original startup failure. The failing child remains
+ * responsible for cleaning up resources acquired by its own incomplete startup.
+ *
+ * <p>Shutdown attempts every child in the configured order before rethrowing the first failure,
+ * with additional failures suppressed on it.
+ */
+public final class LifecycleManager extends AbstractLifecycle {
+
+  private final CopyOnWriteArrayList<Lifecycle> lifecycles = new CopyOnWriteArrayList<>();
+  private final ShutdownOrder shutdownOrder;
+
+  /**
+   * Create a {@link LifecycleManager} that shuts down sub-{@link Lifecycle}s in {@link
+   * ShutdownOrder#LINEAR} order.
+   */
+  public LifecycleManager() {
+    this(ShutdownOrder.LINEAR);
+  }
+
+  /**
+   * Create a {@link LifecycleManager} that shuts down sub-{@link Lifecycle}s in the specified
+   * {@link ShutdownOrder}.
+   *
+   * @param shutdownOrder the {@link ShutdownOrder} to shutdown sub-Lifecycles in.
+   */
+  public LifecycleManager(ShutdownOrder shutdownOrder) {
+    this.shutdownOrder = shutdownOrder;
+  }
+
+  @Override
+  protected void onStartup() {
+    List<Lifecycle> started = new ArrayList<>();
+    try {
+      for (Lifecycle lifecycle : lifecycles) {
+        lifecycle.startup();
+        started.add(lifecycle);
+      }
+    } catch (Throwable startupFailure) {
+      for (int i = started.size() - 1; i >= 0; i--) {
+        try {
+          started.get(i).shutdown();
+        } catch (Throwable cleanupFailure) {
+          if (cleanupFailure != startupFailure) {
+            startupFailure.addSuppressed(cleanupFailure);
+          }
+        }
+      }
+      throw startupFailure;
+    }
+  }
+
+  @Override
+  protected void onShutdown() {
+    Iterator<Lifecycle> iterator =
+        shutdownOrder == ShutdownOrder.LINEAR
+            ? lifecycles.iterator()
+            : Lists.reverse(lifecycles).iterator();
+
+    try {
+      while (iterator.hasNext()) {
+        iterator.next().shutdown();
+      }
+    } catch (Throwable shutdownFailure) {
+      while (iterator.hasNext()) {
+        try {
+          iterator.next().shutdown();
+        } catch (Throwable cleanupFailure) {
+          if (cleanupFailure != shutdownFailure) {
+            shutdownFailure.addSuppressed(cleanupFailure);
+          }
+        }
+      }
+      throw shutdownFailure;
+    }
+  }
+
+  /**
+   * Add a {@link Lifecycle} to be managed.
+   *
+   * <p>This Lifecycle will have {@link Lifecycle#startup()} called when this manager is started and
+   * {@link Lifecycle#shutdown()} called when this manager is shutdown.
+   *
+   * @param lifecycle the {@link Lifecycle} to add.
+   */
+  public void addLifecycle(Lifecycle lifecycle) {
+    lifecycles.add(lifecycle);
+  }
+
+  /**
+   * Remove a previously added {@link Lifecycle}.
+   *
+   * @param lifecycle the {@link Lifecycle} to remove.
+   */
+  public void removeLifecycle(Lifecycle lifecycle) {
+    lifecycles.remove(lifecycle);
+  }
+
+  /**
+   * Add logic to run at startup.
+   *
+   * <p>This is a convenience method for {@link #addLifecycle(Lifecycle)} where {@link
+   * Lifecycle#shutdown()} is implied to be a no-op.
+   *
+   * @param startupTask logic to run at startup.
+   * @return a {@link Lifecycle} instance that can be used with {@link #removeLifecycle(Lifecycle)}
+   *     if needed.
+   */
+  public Lifecycle addStartupTask(Runnable startupTask) {
+    Lifecycle lifecycle =
+        new Lifecycle() {
+          @Override
+          public void startup() {
+            startupTask.run();
+          }
+
+          @Override
+          public void shutdown() {}
+        };
+
+    addLifecycle(lifecycle);
+
+    return lifecycle;
+  }
+
+  /**
+   * Add logic to run at shutdown.
+   *
+   * <p>This is a convenience method for {@link #addLifecycle(Lifecycle)} where {@link
+   * Lifecycle#startup()} is implied to be a no-op.
+   *
+   * @param shutdownTask logic to run at shutdown.
+   * @return a {@link Lifecycle} instance that can be used with {@link #removeLifecycle(Lifecycle)}
+   *     if needed.
+   */
+  public Lifecycle addShutdownTask(Runnable shutdownTask) {
+    Lifecycle lifecycle =
+        new Lifecycle() {
+          @Override
+          public void startup() {}
+
+          @Override
+          public void shutdown() {
+            shutdownTask.run();
+          }
+        };
+
+    addLifecycle(lifecycle);
+
+    return lifecycle;
+  }
+
+  /** Modes that control the order in which registered {@link Lifecycle}s are shutdown. */
+  public enum ShutdownOrder {
+    /** Lifecycles are shutdown in the same order they were added. */
+    LINEAR,
+
+    /** Lifecycles are shutdown in the reverse order they were added. */
+    INVERSE
+  }
+}

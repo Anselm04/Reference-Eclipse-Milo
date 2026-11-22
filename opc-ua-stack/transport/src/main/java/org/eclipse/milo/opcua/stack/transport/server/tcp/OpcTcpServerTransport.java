@@ -1,0 +1,137 @@
+/*
+ * Copyright (c) 2025 the Eclipse Milo Authors
+ *
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ */
+
+package org.eclipse.milo.opcua.stack.transport.server.tcp;
+
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.channel.*;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.logging.LoggingHandler;
+import java.net.InetSocketAddress;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+import org.eclipse.milo.opcua.stack.core.util.Lazy;
+import org.eclipse.milo.opcua.stack.transport.server.OpcServerTransport;
+import org.eclipse.milo.opcua.stack.transport.server.ServerApplicationContext;
+import org.slf4j.LoggerFactory;
+
+public class OpcTcpServerTransport implements OpcServerTransport {
+
+  private final Set<InetSocketAddress> boundAddresses = new HashSet<>();
+  private final Set<Channel> channelReferences = new HashSet<>();
+  private final Set<Channel> childChannelReferences = Collections.synchronizedSet(new HashSet<>());
+  private final Lazy<ServerBootstrap> serverBootstrap = new Lazy<>();
+  private final Lazy<OpcTcpServerReverseConnector> reverseConnector = new Lazy<>();
+
+  private final OpcTcpServerTransportConfig config;
+
+  private boolean reverseConnectsClosed = false;
+
+  public OpcTcpServerTransport(OpcTcpServerTransportConfig config) {
+    this.config = config;
+  }
+
+  @Override
+  public synchronized void bind(
+      ServerApplicationContext applicationContext, InetSocketAddress bindAddress) throws Exception {
+
+    ServerBootstrap bootstrap =
+        serverBootstrap.get(
+            () ->
+                new ServerBootstrap()
+                    .channel(NioServerSocketChannel.class)
+                    .group(config.getEventLoop())
+                    .handler(new LoggingHandler(OpcTcpServerTransport.class))
+                    .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
+                    .childOption(ChannelOption.TCP_NODELAY, true)
+                    .childHandler(
+                        new ChannelInitializer<SocketChannel>() {
+                          @Override
+                          protected void initChannel(SocketChannel channel) {
+                            OpcTcpServerChannelInitializer.initializePassiveChannel(
+                                channel, config, applicationContext, childChannelReferences);
+                          }
+                        }));
+
+    assert bootstrap != null;
+
+    config.getBootstrapCustomizer().accept(bootstrap);
+
+    if (!boundAddresses.contains(bindAddress)) {
+      ChannelFuture bindFuture = bootstrap.bind(bindAddress).sync();
+
+      boundAddresses.add(bindAddress);
+      channelReferences.add(bindFuture.channel());
+      reverseConnectsClosed = false;
+    }
+  }
+
+  @Override
+  public synchronized void unbind() {
+    reverseConnectsClosed = true;
+
+    OpcTcpServerReverseConnector connector = reverseConnector.get(() -> null);
+    if (connector != null) {
+      connector.close();
+    }
+    reverseConnector.reset();
+
+    boundAddresses.clear();
+
+    channelReferences.forEach(channel -> channel.close().syncUninterruptibly());
+    channelReferences.clear();
+
+    Set<Channel> childChannels;
+    synchronized (childChannelReferences) {
+      childChannels = new HashSet<>(childChannelReferences);
+      childChannelReferences.clear();
+    }
+    childChannels.forEach(
+        channel -> {
+          LoggerFactory.getLogger(getClass()).info("Closing child channel: {}", channel);
+          channel.close().syncUninterruptibly();
+        });
+
+    serverBootstrap.reset();
+  }
+
+  /**
+   * Start one outbound UA-TCP reverse-connect attempt.
+   *
+   * <p>The attempt opens a client-direction socket, sends {@code ReverseHello}, and then hands a
+   * successful channel to the normal server-side UASC pipeline. This method does not bind or
+   * require a passive server listener. The returned attempt owns the channel only until handoff;
+   * after the client sends {@code Hello}, normal server transport and SecureChannel handling own
+   * the channel lifecycle.
+   *
+   * @param parameters the reverse-connect attempt parameters.
+   * @return a handle that observes and controls the attempt.
+   */
+  public OpcTcpServerReverseConnectAttempt connectReverse(
+      OpcTcpServerReverseConnectParameters parameters) {
+
+    synchronized (this) {
+      if (reverseConnectsClosed) {
+        throw new IllegalStateException("transport is unbound");
+      }
+
+      OpcTcpServerReverseConnector connector =
+          reverseConnector.get(() -> new OpcTcpServerReverseConnector(config));
+
+      // Issue the connect under the transport lock so a concurrent unbind cannot close the
+      // connector and surface a misleading "OpcTcpServerReverseConnector is closed" message from
+      // a freshly issued connect.
+      return connector.connect(parameters);
+    }
+  }
+}

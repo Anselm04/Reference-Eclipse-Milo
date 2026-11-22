@@ -1,0 +1,931 @@
+/*
+ * Copyright (c) 2025 the Eclipse Milo Authors
+ *
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ */
+
+package org.eclipse.milo.opcua.stack.transport.client.uasc;
+
+import static org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.uint;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.CompositeByteBuf;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.ByteToMessageCodec;
+import io.netty.util.ReferenceCountUtil;
+import io.netty.util.Timeout;
+import java.security.KeyPair;
+import java.security.cert.X509Certificate;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+import org.eclipse.milo.opcua.stack.core.StatusCodes;
+import org.eclipse.milo.opcua.stack.core.UaException;
+import org.eclipse.milo.opcua.stack.core.UaSerializationException;
+import org.eclipse.milo.opcua.stack.core.UaServiceFaultException;
+import org.eclipse.milo.opcua.stack.core.channel.ChannelParameters;
+import org.eclipse.milo.opcua.stack.core.channel.ChannelSecurity;
+import org.eclipse.milo.opcua.stack.core.channel.ChunkDecoder;
+import org.eclipse.milo.opcua.stack.core.channel.ChunkDecoder.DecodedMessage;
+import org.eclipse.milo.opcua.stack.core.channel.ChunkEncoder;
+import org.eclipse.milo.opcua.stack.core.channel.ChunkEncoder.EncodedMessage;
+import org.eclipse.milo.opcua.stack.core.channel.MessageAbortException;
+import org.eclipse.milo.opcua.stack.core.channel.MessageDecodeException;
+import org.eclipse.milo.opcua.stack.core.channel.MessageEncodeException;
+import org.eclipse.milo.opcua.stack.core.channel.SecurityKeysListener;
+import org.eclipse.milo.opcua.stack.core.channel.SecurityKeyset;
+import org.eclipse.milo.opcua.stack.core.channel.headers.AsymmetricSecurityHeader;
+import org.eclipse.milo.opcua.stack.core.channel.messages.ErrorMessage;
+import org.eclipse.milo.opcua.stack.core.channel.messages.MessageType;
+import org.eclipse.milo.opcua.stack.core.channel.messages.TcpMessageDecoder;
+import org.eclipse.milo.opcua.stack.core.encoding.binary.OpcUaBinaryDecoder;
+import org.eclipse.milo.opcua.stack.core.encoding.binary.OpcUaBinaryEncoder;
+import org.eclipse.milo.opcua.stack.core.security.CertificateCompatibility;
+import org.eclipse.milo.opcua.stack.core.security.CertificateIdentity;
+import org.eclipse.milo.opcua.stack.core.security.CertificateValidator;
+import org.eclipse.milo.opcua.stack.core.security.SecurityPolicy;
+import org.eclipse.milo.opcua.stack.core.security.SecurityPolicyProfile;
+import org.eclipse.milo.opcua.stack.core.types.UaMessageType;
+import org.eclipse.milo.opcua.stack.core.types.UaRequestMessageType;
+import org.eclipse.milo.opcua.stack.core.types.UaResponseMessageType;
+import org.eclipse.milo.opcua.stack.core.types.builtin.ByteString;
+import org.eclipse.milo.opcua.stack.core.types.builtin.DateTime;
+import org.eclipse.milo.opcua.stack.core.types.builtin.StatusCode;
+import org.eclipse.milo.opcua.stack.core.types.enumerated.MessageSecurityMode;
+import org.eclipse.milo.opcua.stack.core.types.enumerated.SecurityTokenRequestType;
+import org.eclipse.milo.opcua.stack.core.types.structured.ChannelSecurityToken;
+import org.eclipse.milo.opcua.stack.core.types.structured.CloseSecureChannelRequest;
+import org.eclipse.milo.opcua.stack.core.types.structured.EndpointDescription;
+import org.eclipse.milo.opcua.stack.core.types.structured.OpenSecureChannelRequest;
+import org.eclipse.milo.opcua.stack.core.types.structured.OpenSecureChannelResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.RequestHeader;
+import org.eclipse.milo.opcua.stack.core.types.structured.ServiceFault;
+import org.eclipse.milo.opcua.stack.core.util.BufferUtil;
+import org.eclipse.milo.opcua.stack.core.util.CertificateUtil;
+import org.eclipse.milo.opcua.stack.core.util.NonceUtil;
+import org.eclipse.milo.opcua.stack.transport.client.ClientApplicationContext;
+import org.eclipse.milo.opcua.stack.transport.client.SecureChannelHandshakeException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class UascClientMessageHandler extends ByteToMessageCodec<UascRequest> {
+
+  private static final long PROTOCOL_VERSION = 0L;
+
+  private static final Logger LOGGER = LoggerFactory.getLogger(UascClientMessageHandler.class);
+
+  private final AtomicReference<AsymmetricSecurityHeader> headerRef = new AtomicReference<>();
+
+  private List<ByteBuf> chunkBuffers = new ArrayList<>();
+
+  private ScheduledFuture<?> renewFuture;
+  private Timeout secureChannelTimeout;
+
+  // AEAD profiles may need renewal because their sequence/nonce space is nearly exhausted, not only
+  // because the server-issued token lifetime is close to expiring.
+  private volatile boolean renewalRequestPending;
+
+  // For enhanced OpenSecureChannel requests, createClientNonce() sends the ephemeral public key in
+  // ClientNonce and retains the matching private key here until the signed response arrives.
+  // installSecurityToken() consumes it to derive symmetric keys, then clears the reference because
+  // each Issue/Renew exchange must use fresh ephemeral key material.
+  private volatile KeyPair localEphemeralKeyPair;
+  private volatile byte[] openSecureChannelIssueRequestSignature;
+
+  private ClientSecureChannel secureChannel;
+
+  private final OpcUaBinaryDecoder binaryDecoder;
+  private final OpcUaBinaryEncoder binaryEncoder;
+  private final ChunkDecoder chunkDecoder;
+  private final ChunkEncoder chunkEncoder;
+
+  private final UascClientConfig config;
+  private final ClientApplicationContext application;
+  private final Supplier<Long> requestIdSupplier;
+  private final CompletableFuture<ClientSecureChannel> handshakeFuture;
+  private final ChannelParameters channelParameters;
+
+  public UascClientMessageHandler(
+      UascClientConfig config,
+      ClientApplicationContext application,
+      Supplier<Long> requestIdSupplier,
+      CompletableFuture<ClientSecureChannel> handshakeFuture,
+      List<UaRequestMessageType> awaitingHandshake,
+      ChannelParameters channelParameters) {
+
+    this.config = config;
+    this.application = application;
+    this.requestIdSupplier = requestIdSupplier;
+    this.handshakeFuture = handshakeFuture;
+    this.channelParameters = channelParameters;
+
+    binaryDecoder = new OpcUaBinaryDecoder(application.getEncodingContext());
+    binaryEncoder = new OpcUaBinaryEncoder(application.getEncodingContext());
+
+    chunkDecoder =
+        new ChunkDecoder(channelParameters, application.getEncodingContext().getEncodingLimits());
+    chunkEncoder = new ChunkEncoder(channelParameters);
+
+    handshakeFuture.thenAccept(
+        sc -> {
+          Channel channel = sc.getChannel();
+
+          channel
+              .eventLoop()
+              .execute(
+                  () -> {
+                    LOGGER.debug(
+                        "{} message(s) queued before handshake completed; sending now.",
+                        awaitingHandshake.size());
+
+                    awaitingHandshake.forEach(channel::writeAndFlush);
+                    awaitingHandshake.clear();
+                  });
+        });
+  }
+
+  private void failHandshake(Throwable cause) {
+    handshakeFuture.completeExceptionally(new SecureChannelHandshakeException(cause));
+  }
+
+  @Override
+  public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+    releaseChunkBuffers();
+
+    if (renewFuture != null) {
+      renewFuture.cancel(false);
+    }
+
+    UaException exception = new UaException(StatusCodes.Bad_ConnectionClosed, "connection closed");
+
+    failHandshake(exception);
+
+    super.channelInactive(ctx);
+  }
+
+  @Override
+  public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+    LOGGER.error(
+        "[remote={}] Exception caught: {}",
+        ctx.channel().remoteAddress(),
+        cause.getMessage(),
+        cause);
+
+    releaseChunkBuffers();
+
+    // If the handshake hasn't completed yet this cause will be more
+    // accurate than the generic "connection closed" exception that
+    // channelInactive() will use.
+    failHandshake(cause);
+
+    ctx.close();
+  }
+
+  @Override
+  public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
+    releaseChunkBuffers();
+    super.handlerRemoved(ctx);
+  }
+
+  private void releaseChunkBuffers() {
+    chunkBuffers.forEach(ReferenceCountUtil::safeRelease);
+    chunkBuffers.clear();
+  }
+
+  @Override
+  public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+    secureChannel = newSecureChannel(application);
+    secureChannel.setChannel(ctx.channel());
+
+    SecurityTokenRequestType requestType =
+        secureChannel.getChannelId() == 0
+            ? SecurityTokenRequestType.Issue
+            : SecurityTokenRequestType.Renew;
+
+    secureChannelTimeout =
+        config
+            .getWheelTimer()
+            .newTimeout(
+                timeout -> {
+                  if (!timeout.isCancelled()) {
+                    failHandshake(
+                        new UaException(
+                            StatusCodes.Bad_Timeout, "timed out waiting for secure channel"));
+                    ctx.close();
+                  }
+                },
+                application.getRequestTimeout().longValue(),
+                TimeUnit.MILLISECONDS);
+
+    LOGGER.debug("OpenSecureChannel timeout scheduled for +{}ms", application.getRequestTimeout());
+
+    sendOpenSecureChannelRequest(ctx, requestType);
+  }
+
+  @Override
+  public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+    if (evt instanceof CloseSecureChannelRequest request) {
+      sendCloseSecureChannelRequest(ctx, request);
+    }
+  }
+
+  @Override
+  protected void encode(ChannelHandlerContext ctx, UascRequest request, ByteBuf buffer)
+      throws Exception {
+    ByteBuf messageBuffer = BufferUtil.pooledBuffer();
+
+    try {
+      binaryEncoder.setBuffer(messageBuffer);
+      binaryEncoder.encodeMessage(null, request.getRequestMessage());
+
+      checkMessageSize(messageBuffer);
+
+      renewSecureChannelIfRequired(ctx);
+
+      EncodedMessage encodedMessage =
+          chunkEncoder.encodeSymmetric(
+              secureChannel, request.getRequestId(), messageBuffer, MessageType.SecureMessage);
+
+      List<ByteBuf> messageChunks = encodedMessage.getMessageChunks();
+
+      CompositeByteBuf chunkComposite = BufferUtil.compositeBuffer();
+
+      for (ByteBuf chunk : messageChunks) {
+        chunkComposite.addComponent(chunk);
+        chunkComposite.writerIndex(chunkComposite.writerIndex() + chunk.readableBytes());
+      }
+
+      ctx.writeAndFlush(chunkComposite, ctx.voidPromise());
+    } catch (MessageEncodeException e) {
+      LOGGER.error("Error encoding {}: {}", request, e.getMessage(), e);
+
+      UascResponse response = UascResponse.failure(request.getRequestId(), new UaException(e));
+
+      ctx.fireUserEventTriggered(response);
+
+      // failure during symmetric encoding is fatal
+      ctx.close();
+    } catch (UaSerializationException e) {
+      LOGGER.error("Error serializing {}: {}", request, e.getMessage(), e);
+
+      UascResponse response = UascResponse.failure(request.getRequestId(), new UaException(e));
+
+      ctx.fireUserEventTriggered(response);
+    } finally {
+      messageBuffer.release();
+    }
+  }
+
+  @Override
+  protected void decode(ChannelHandlerContext ctx, ByteBuf buffer, List<Object> out)
+      throws Exception {
+    if (buffer.readableBytes() >= 8) {
+      int messageLength = getMessageLength(buffer, channelParameters.getLocalReceiveBufferSize());
+
+      if (buffer.readableBytes() >= messageLength) {
+        MessageType messageType =
+            MessageType.fromMediumInt(buffer.getMediumLE(buffer.readerIndex()));
+
+        switch (messageType) {
+          case OpenSecureChannel:
+            onOpenSecureChannel(ctx, buffer.readSlice(messageLength));
+            break;
+
+          case SecureMessage:
+            onSecureMessage(ctx, buffer.readSlice(messageLength), out);
+            break;
+
+          case Error:
+            onError(ctx, buffer.readSlice(messageLength));
+            break;
+
+          default:
+            throw new UaException(
+                StatusCodes.Bad_TcpMessageTypeInvalid, "unexpected MessageType: " + messageType);
+        }
+      }
+    }
+  }
+
+  private void onSecureMessage(ChannelHandlerContext ctx, ByteBuf buffer, List<Object> out)
+      throws UaException {
+    buffer.skipBytes(3 + 1 + 4); // skip messageType, chunkType, messageSize
+
+    long secureChannelId = buffer.readUnsignedIntLE();
+    if (secureChannelId != secureChannel.getChannelId()) {
+      throw new UaException(
+          StatusCodes.Bad_SecureChannelIdInvalid, "invalid secure channel id: " + secureChannelId);
+    }
+
+    if (accumulateChunk(buffer)) {
+      final List<ByteBuf> buffersToDecode = chunkBuffers;
+      chunkBuffers = new ArrayList<>(getMaxChunkCount());
+
+      ByteBuf messageBuffer = null;
+
+      try {
+        DecodedMessage decodedMessage =
+            chunkDecoder.decodeSymmetric(secureChannel, buffersToDecode);
+
+        messageBuffer = decodedMessage.getMessage();
+
+        binaryDecoder.setBuffer(messageBuffer);
+        UaMessageType message = binaryDecoder.decodeMessage(null);
+
+        if (message instanceof ServiceFault serviceFault) {
+          UascResponse response =
+              UascResponse.failure(
+                  decodedMessage.getRequestId(), new UaServiceFaultException(serviceFault));
+          out.add(response);
+        } else if (message instanceof UaResponseMessageType responseMessage) {
+          UascResponse response =
+              UascResponse.success(decodedMessage.getRequestId(), responseMessage);
+          out.add(response);
+        } else {
+          UascResponse response =
+              UascResponse.failure(
+                  decodedMessage.getRequestId(),
+                  new UaException(
+                      StatusCodes.Bad_UnknownResponse, message.getClass().getSimpleName()));
+          out.add(response);
+        }
+      } catch (MessageAbortException e) {
+        logMessageAbort(e);
+
+        out.add(
+            UascResponse.failure(
+                e.getRequestId(), new UaException(e.getStatusCode(), e.getMessage())));
+      } catch (MessageDecodeException e) {
+        LOGGER.error("Error decoding symmetric message", e);
+
+        ctx.close();
+      } finally {
+        if (messageBuffer != null) {
+          messageBuffer.release();
+        }
+      }
+    }
+  }
+
+  private void onOpenSecureChannel(ChannelHandlerContext ctx, ByteBuf buffer) throws UaException {
+    if (secureChannelTimeout != null) {
+      if (secureChannelTimeout.cancel()) {
+        LOGGER.debug("OpenSecureChannel timeout canceled");
+
+        secureChannelTimeout = null;
+      } else {
+        LOGGER.warn("timed out waiting for secure channel");
+
+        failHandshake(
+            new UaException(StatusCodes.Bad_Timeout, "timed out waiting for secure channel"));
+        ctx.close();
+        return;
+      }
+    }
+
+    buffer.skipBytes(3 + 1 + 4 + 4); // skip messageType, chunkType, messageSize, secureChannelId
+
+    AsymmetricSecurityHeader securityHeader =
+        AsymmetricSecurityHeader.decode(
+            buffer, application.getEncodingContext().getEncodingLimits());
+
+    if (headerRef.compareAndSet(null, securityHeader)) {
+      // first time we've received the header; validate and verify the server certificate
+      CertificateValidator certificateValidator = application.getCertificateValidator();
+
+      SecurityPolicy securityPolicy = SecurityPolicy.fromUri(securityHeader.getSecurityPolicyUri());
+
+      if (securityPolicy != SecurityPolicy.None) {
+        ByteString serverCertificateBytes = securityHeader.getSenderCertificate();
+
+        List<X509Certificate> serverCertificateChain =
+            CertificateUtil.decodeCertificates(serverCertificateBytes.bytesOrEmpty());
+
+        certificateValidator.validateCertificateChain(
+            serverCertificateChain, null, null, securityPolicy.getProfile());
+      }
+    } else {
+      if (!securityHeader.equals(headerRef.get())) {
+        throw new UaException(
+            StatusCodes.Bad_SecurityChecksFailed,
+            "subsequent AsymmetricSecurityHeader did not match");
+      }
+    }
+
+    if (accumulateChunk(buffer)) {
+      final List<ByteBuf> buffersToDecode = chunkBuffers;
+      chunkBuffers = new ArrayList<>(getMaxChunkCount());
+
+      ByteBuf messageBuffer = null;
+
+      try {
+        boolean initialIssueResponse =
+            secureChannel.getChannelId() == 0L
+                && secureChannel.getSecurityPolicyProfile().secureChannelEnhancements();
+
+        DecodedMessage decodedMessage =
+            chunkDecoder.decodeAsymmetric(
+                secureChannel,
+                buffersToDecode,
+                initialIssueResponse ? openSecureChannelIssueRequestSignature : null);
+
+        messageBuffer = decodedMessage.getMessage();
+
+        binaryDecoder.setBuffer(messageBuffer);
+        UaResponseMessageType responseMessage =
+            (UaResponseMessageType) binaryDecoder.decodeMessage(null);
+
+        StatusCode serviceResult = responseMessage.getResponseHeader().getServiceResult();
+
+        if (serviceResult.isGood()) {
+          OpenSecureChannelResponse response = (OpenSecureChannelResponse) responseMessage;
+          LOGGER.debug("Received OpenSecureChannelResponse.");
+
+          secureChannel.setChannelId(response.getSecurityToken().getChannelId().longValue());
+
+          if (initialIssueResponse) {
+            byte[] signature = decodedMessage.getSignature();
+            if (signature == null) {
+              throw new UaException(
+                  StatusCodes.Bad_SecurityChecksFailed,
+                  "missing OpenSecureChannel response signature");
+            }
+            secureChannel.setChannelThumbprint(ByteString.of(signature));
+          }
+
+          installSecurityToken(ctx, response);
+
+          handshakeFuture.complete(secureChannel);
+        } else {
+          ServiceFault serviceFault =
+              (responseMessage instanceof ServiceFault fault)
+                  ? fault
+                  : new ServiceFault(responseMessage.getResponseHeader());
+
+          failHandshake(new UaServiceFaultException(serviceFault));
+          ctx.close();
+        }
+      } catch (MessageAbortException e) {
+        logMessageAbort(e);
+      } catch (MessageDecodeException e) {
+        LOGGER.error("Error decoding asymmetric message", e);
+
+        failHandshake(e);
+
+        ctx.close();
+      } catch (Exception e) {
+        LOGGER.error("Error decoding OpenSecureChannelResponse", e);
+
+        failHandshake(e);
+
+        ctx.close();
+      } finally {
+        if (messageBuffer != null) {
+          messageBuffer.release();
+        }
+      }
+    }
+  }
+
+  private void logMessageAbort(MessageAbortException e) {
+    LOGGER.warn(
+        "Received message abort chunk; error={}, reason={}", e.getStatusCode(), e.getMessage());
+  }
+
+  private void installSecurityToken(ChannelHandlerContext ctx, OpenSecureChannelResponse response)
+      throws UaException {
+
+    if (response.getServerProtocolVersion().longValue() < PROTOCOL_VERSION) {
+      throw new UaException(
+          StatusCodes.Bad_ProtocolVersionUnsupported,
+          "server protocol version unsupported: " + response.getServerProtocolVersion());
+    }
+
+    ChannelSecurity.SecurityKeys newKeys = null;
+    ChannelSecurityToken newToken = response.getSecurityToken();
+
+    if (secureChannel.isSymmetricSigningEnabled()) {
+      ByteString serverNonce = response.getServerNonce();
+
+      NonceUtil.validateNonce(serverNonce, secureChannel.getSecurityPolicy());
+
+      secureChannel.setRemoteNonce(serverNonce);
+
+      if (secureChannel.getSecurityPolicyProfile().usesEphemeralKeyAgreement()) {
+        KeyPair ephemeralKeyPair = localEphemeralKeyPair;
+
+        if (ephemeralKeyPair == null) {
+          throw new UaException(
+              StatusCodes.Bad_SecurityChecksFailed,
+              "missing local ephemeral key pair for OpenSecureChannel response");
+        }
+
+        try {
+          newKeys =
+              ChannelSecurity.generateKeyPair(
+                  secureChannel,
+                  ephemeralKeyPair,
+                  secureChannel.getLocalNonce(),
+                  secureChannel.getRemoteNonce(),
+                  serverNonce);
+        } finally {
+          localEphemeralKeyPair = null;
+        }
+      } else {
+        newKeys =
+            ChannelSecurity.generateKeyPair(
+                secureChannel, secureChannel.getLocalNonce(), secureChannel.getRemoteNonce());
+      }
+    }
+
+    ChannelSecurity oldSecrets = secureChannel.getChannelSecurity();
+    ChannelSecurity.SecurityKeys oldKeys = oldSecrets != null ? oldSecrets.getCurrentKeys() : null;
+    ChannelSecurityToken oldToken = oldSecrets != null ? oldSecrets.getCurrentToken() : null;
+
+    secureChannel.setChannelSecurity(new ChannelSecurity(newKeys, newToken, oldKeys, oldToken));
+    renewalRequestPending = false;
+
+    SecurityKeysListener listener = application.getSecurityKeysListener();
+
+    if (listener != null && newKeys != null) {
+      listener.onSecurityKeysCreated(SecurityKeyset.from(secureChannel, newKeys, newToken));
+    }
+
+    DateTime createdAt = response.getSecurityToken().getCreatedAt();
+    long revisedLifetime = response.getSecurityToken().getRevisedLifetime().longValue();
+
+    // Cancel any previously scheduled lifetime timer before installing this token. A
+    // threshold-triggered renewal (renewSecureChannelIfRequired) installs a fresh token without
+    // firing the prior timer, so the prior chain would otherwise stay armed and later fire a
+    // second, overlapping Renew.
+    if (renewFuture != null) {
+      renewFuture.cancel(false);
+    }
+
+    if (revisedLifetime > 0) {
+      long renewAt = (long) (revisedLifetime * 0.75);
+      renewFuture =
+          ctx.executor().schedule(() -> renewSecureChannel(ctx), renewAt, TimeUnit.MILLISECONDS);
+    } else {
+      LOGGER.warn("Server revised secure channel lifetime to 0; renewal will not occur.");
+    }
+
+    ctx.executor()
+        .execute(
+            () -> {
+              // SecureChannel is ready; remove the acknowledge handler.
+              if (ctx.pipeline().get(UascClientAcknowledgeHandler.class) != null) {
+                ctx.pipeline().remove(UascClientAcknowledgeHandler.class);
+              }
+            });
+
+    ChannelSecurity channelSecurity = secureChannel.getChannelSecurity();
+
+    long currentTokenId = channelSecurity.getCurrentToken().getTokenId().longValue();
+
+    long previousTokenId =
+        channelSecurity.getPreviousToken().map(t -> t.getTokenId().longValue()).orElse(-1L);
+
+    LOGGER.debug(
+        "SecureChannel id={}, currentTokenId={}, previousTokenId={}, lifetime={}ms, createdAt={}",
+        secureChannel.getChannelId(),
+        currentTokenId,
+        previousTokenId,
+        revisedLifetime,
+        createdAt);
+  }
+
+  private void onError(ChannelHandlerContext ctx, ByteBuf buffer) {
+    try {
+      ErrorMessage errorMessage = TcpMessageDecoder.decodeError(buffer);
+      StatusCode statusCode = errorMessage.getError();
+
+      LOGGER.error("[remote={}] errorMessage={}", ctx.channel().remoteAddress(), errorMessage);
+
+      failHandshake(new UaException(statusCode, errorMessage.getReason()));
+
+      ctx.fireUserEventTriggered(errorMessage);
+    } catch (UaException e) {
+      LOGGER.error(
+          "[remote={}] An exception occurred while decoding an error message: {}",
+          ctx.channel().remoteAddress(),
+          e.getMessage(),
+          e);
+
+      failHandshake(e);
+    } finally {
+      ctx.close();
+    }
+  }
+
+  private boolean accumulateChunk(ByteBuf buffer) throws UaException {
+    int maxChunkCount = getMaxChunkCount();
+    int maxChunkSize = getMaxChunkSize();
+
+    //noinspection DuplicatedCode
+    int chunkSize = buffer.readerIndex(0).readableBytes();
+
+    if (chunkSize > maxChunkSize) {
+      throw new UaException(
+          StatusCodes.Bad_TcpMessageTooLarge,
+          String.format("max chunk size exceeded (%s)", maxChunkSize));
+    }
+
+    chunkBuffers.add(buffer.retain());
+
+    char chunkType = (char) buffer.getByte(3);
+
+    if (chunkType != 'A' && maxChunkCount > 0 && chunkBuffers.size() > maxChunkCount) {
+      throw new UaException(
+          StatusCodes.Bad_TcpMessageTooLarge,
+          String.format("max chunk count exceeded (%s)", maxChunkCount));
+    }
+
+    return (chunkType == 'A' || chunkType == 'F');
+  }
+
+  private void sendOpenSecureChannelRequest(
+      ChannelHandlerContext ctx, SecurityTokenRequestType requestType) {
+    if (requestType == SecurityTokenRequestType.Renew) {
+      renewalRequestPending = true;
+    }
+
+    ByteBuf messageBuffer = BufferUtil.pooledBuffer();
+    OpenSecureChannelRequest request = null;
+
+    try {
+      ByteString clientNonce = createClientNonce();
+
+      secureChannel.setLocalNonce(clientNonce);
+
+      var header =
+          new RequestHeader(
+              null, DateTime.now(), uint(0), uint(0), null, application.getRequestTimeout(), null);
+
+      request =
+          new OpenSecureChannelRequest(
+              header,
+              uint(PROTOCOL_VERSION),
+              requestType,
+              secureChannel.getMessageSecurityMode(),
+              secureChannel.getLocalNonce(),
+              config.getChannelLifetime());
+
+      binaryEncoder.setBuffer(messageBuffer);
+      binaryEncoder.encodeMessage(null, request);
+
+      checkMessageSize(messageBuffer);
+
+      EncodedMessage encodedMessage =
+          chunkEncoder.encodeAsymmetric(
+              secureChannel, requestIdSupplier.get(), messageBuffer, MessageType.OpenSecureChannel);
+
+      if (requestType == SecurityTokenRequestType.Issue
+          && secureChannel.getSecurityPolicyProfile().secureChannelEnhancements()) {
+        openSecureChannelIssueRequestSignature = encodedMessage.getSignature();
+        if (openSecureChannelIssueRequestSignature == null) {
+          throw new UaException(
+              StatusCodes.Bad_SecurityChecksFailed, "missing OpenSecureChannel request signature");
+        }
+        secureChannel.setChannelThumbprint(ByteString.NULL_VALUE);
+      }
+
+      CompositeByteBuf chunkComposite = BufferUtil.compositeBuffer();
+
+      for (ByteBuf chunk : encodedMessage.getMessageChunks()) {
+        chunkComposite.addComponent(chunk);
+        chunkComposite.writerIndex(chunkComposite.writerIndex() + chunk.readableBytes());
+      }
+
+      ctx.writeAndFlush(chunkComposite, ctx.voidPromise());
+
+      ChannelSecurity channelSecurity = secureChannel.getChannelSecurity();
+
+      long currentTokenId = -1L;
+      if (channelSecurity != null) {
+        currentTokenId = channelSecurity.getCurrentToken().getTokenId().longValue();
+      }
+
+      long previousTokenId = -1L;
+      if (channelSecurity != null) {
+        previousTokenId =
+            channelSecurity
+                .getPreviousToken()
+                .map(token -> token.getTokenId().longValue())
+                .orElse(-1L);
+      }
+
+      LOGGER.debug(
+          "Sent OpenSecureChannelRequest ({}, id={}, currentToken={}, previousToken={}).",
+          request.getRequestType(),
+          secureChannel.getChannelId(),
+          currentTokenId,
+          previousTokenId);
+    } catch (MessageEncodeException e) {
+      LOGGER.error("Error encoding {}: {}", request, e.getMessage(), e);
+
+      ctx.close();
+    } catch (UaException e) {
+      LOGGER.error("Error preparing OpenSecureChannelRequest: {}", e.getStatusCode(), e);
+
+      failHandshake(e);
+      ctx.close();
+    } finally {
+      messageBuffer.release();
+    }
+  }
+
+  private ByteString createClientNonce() throws UaException {
+    if (!secureChannel.isSymmetricSigningEnabled()) {
+      localEphemeralKeyPair = null;
+
+      return ByteString.NULL_VALUE;
+    }
+
+    SecurityPolicyProfile profile = secureChannel.getSecurityPolicyProfile();
+
+    if (profile.usesEphemeralKeyAgreement()) {
+      localEphemeralKeyPair = ChannelSecurity.generateEphemeralKeyPair(profile);
+
+      return ChannelSecurity.encodeEphemeralPublicKey(profile, localEphemeralKeyPair);
+    } else {
+      localEphemeralKeyPair = null;
+
+      return NonceUtil.generateNonce(secureChannel.getSecurityPolicy());
+    }
+  }
+
+  private void renewSecureChannelIfRequired(ChannelHandlerContext ctx) {
+    if (chunkEncoder.isSecureChannelRenewalRequired(secureChannel)) {
+      LOGGER.debug("AEAD SecureChannel renewal threshold reached.");
+
+      renewSecureChannel(ctx);
+    }
+  }
+
+  /**
+   * Initiates a single OpenSecureChannel Renew exchange, suppressing it if one is already in flight
+   * or the channel is no longer active.
+   *
+   * <p>Both renewal initiators — the 75%-lifetime timer and the AEAD sequence-space threshold check
+   * in {@link #renewSecureChannelIfRequired} — funnel through here so at most one Renew is ever
+   * outstanding. A second Renew sent before the first response arrives would overwrite the single
+   * {@link #localEphemeralKeyPair}/{@code localNonce} slots and tear the channel down, so the
+   * in-flight {@link #renewalRequestPending} flag (cleared in {@link #installSecurityToken}) gates
+   * every initiator. The flag is read and set on the channel event loop, so the check-and-set is
+   * serialized without further synchronization.
+   */
+  private void renewSecureChannel(ChannelHandlerContext ctx) {
+    if (renewalRequestPending) {
+      LOGGER.debug("OpenSecureChannel Renew already in flight; skipping renewal.");
+      return;
+    }
+
+    if (!ctx.channel().isActive()) {
+      LOGGER.debug("Channel no longer active; skipping OpenSecureChannel Renew.");
+      return;
+    }
+
+    sendOpenSecureChannelRequest(ctx, SecurityTokenRequestType.Renew);
+  }
+
+  private void sendCloseSecureChannelRequest(
+      ChannelHandlerContext ctx, CloseSecureChannelRequest request) {
+    ByteBuf messageBuffer = BufferUtil.pooledBuffer();
+
+    try {
+      binaryEncoder.setBuffer(messageBuffer);
+      binaryEncoder.encodeMessage(null, request);
+
+      checkMessageSize(messageBuffer);
+
+      EncodedMessage encodedMessage =
+          chunkEncoder.encodeSymmetric(
+              secureChannel,
+              requestIdSupplier.get(),
+              messageBuffer,
+              MessageType.CloseSecureChannel);
+
+      CompositeByteBuf chunkComposite = BufferUtil.compositeBuffer();
+
+      for (ByteBuf chunk : encodedMessage.getMessageChunks()) {
+        chunkComposite.addComponent(chunk);
+        chunkComposite.writerIndex(chunkComposite.writerIndex() + chunk.readableBytes());
+      }
+
+      ctx.writeAndFlush(chunkComposite).addListener(future -> ctx.close());
+
+      secureChannel.setChannelId(0);
+    } catch (MessageEncodeException e) {
+      LOGGER.error("Error encoding {}: {}", request, e.getMessage(), e);
+      failHandshake(e);
+      ctx.close();
+    } catch (UaSerializationException e) {
+      LOGGER.error("Error serializing {}: {}", request, e.getMessage(), e);
+      failHandshake(e);
+      ctx.close();
+    } finally {
+      messageBuffer.release();
+    }
+  }
+
+  private void checkMessageSize(ByteBuf messageBuffer) throws UaSerializationException {
+    int messageSize = messageBuffer.readableBytes();
+    int remoteMaxMessageSize = channelParameters.getRemoteMaxMessageSize();
+
+    if (remoteMaxMessageSize > 0 && messageSize > remoteMaxMessageSize) {
+      throw new UaSerializationException(
+          StatusCodes.Bad_RequestTooLarge,
+          "request exceeds remote max message size: " + messageSize + " > " + remoteMaxMessageSize);
+    }
+  }
+
+  private int getMaxChunkCount() {
+    return channelParameters.getLocalMaxChunkCount();
+  }
+
+  private int getMaxChunkSize() {
+    return channelParameters.getLocalReceiveBufferSize();
+  }
+
+  private static ClientSecureChannel newSecureChannel(ClientApplicationContext application)
+      throws UaException {
+    EndpointDescription endpoint = application.getEndpoint();
+
+    SecurityPolicy securityPolicy = SecurityPolicy.fromUri(endpoint.getSecurityPolicyUri());
+    requireSupportedMessageSecurityMode(securityPolicy.getProfile(), endpoint.getSecurityMode());
+
+    if (securityPolicy == SecurityPolicy.None) {
+      return new ClientSecureChannel(securityPolicy, endpoint.getSecurityMode());
+    } else {
+      CertificateIdentity certificateIdentity =
+          application
+              .getCertificateIdentity(securityPolicy.getProfile())
+              .orElseThrow(
+                  () ->
+                      new UaException(
+                          StatusCodes.Bad_ConfigurationError,
+                          "no certificate identity for security policy: "
+                              + securityPolicy.getUri()));
+
+      KeyPair keyPair = certificateIdentity.keyPair();
+      X509Certificate certificate = certificateIdentity.certificate();
+      List<X509Certificate> certificateChain =
+          Arrays.asList(certificateIdentity.certificateChain());
+
+      if (securityPolicy.getProfile().secureChannelEnhancements()) {
+        CertificateCompatibility.checkCompatible(securityPolicy.getProfile(), certificate);
+      }
+
+      X509Certificate remoteCertificate =
+          CertificateUtil.decodeCertificate(endpoint.getServerCertificate().bytes());
+
+      List<X509Certificate> remoteCertificateChain =
+          CertificateUtil.decodeCertificates(endpoint.getServerCertificate().bytes());
+
+      return new ClientSecureChannel(
+          keyPair,
+          certificate,
+          certificateChain,
+          remoteCertificate,
+          remoteCertificateChain,
+          securityPolicy,
+          endpoint.getSecurityMode());
+    }
+  }
+
+  private static int getMessageLength(ByteBuf buffer, int maxMessageLength) throws UaException {
+    long messageLength = buffer.getUnsignedIntLE(buffer.readerIndex() + 4);
+
+    if (messageLength <= maxMessageLength) {
+      return (int) messageLength;
+    } else {
+      throw new UaException(
+          StatusCodes.Bad_TcpMessageTooLarge,
+          String.format("max message length exceeded (%s > %s)", messageLength, maxMessageLength));
+    }
+  }
+
+  private static void requireSupportedMessageSecurityMode(
+      SecurityPolicyProfile profile, MessageSecurityMode securityMode) throws UaException {
+
+    if (!profile.isMessageSecurityModeSupported(securityMode)) {
+      throw new UaException(
+          StatusCodes.Bad_SecurityPolicyRejected,
+          "message security mode is not supported for "
+              + profile.securityPolicy().getUri()
+              + ": "
+              + securityMode);
+    }
+  }
+}

@@ -1,0 +1,4 @@
+Upstream: https://github.com/eclipse-milo/milo
+Upstream branch: main
+Upstream commit: 5eeb9cec0c7168463f65ebfa7cd14b26eee6f029
+Source imported with upstream Git ancestry. Upstream Actions workflows excluded due to GitHub token permissions.

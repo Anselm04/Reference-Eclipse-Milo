@@ -1,0 +1,478 @@
+/*
+ * Copyright (c) 2025 the Eclipse Milo Authors
+ *
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ */
+
+package org.eclipse.milo.opcua.sdk.server.servicesets.impl;
+
+import static org.eclipse.milo.opcua.sdk.server.servicesets.AbstractServiceSet.createResponseHeader;
+import static org.eclipse.milo.opcua.stack.core.util.FutureUtils.failedUaFuture;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import org.eclipse.milo.opcua.sdk.server.OpcUaServer;
+import org.eclipse.milo.opcua.sdk.server.Session;
+import org.eclipse.milo.opcua.sdk.server.access.AccessController.AccessResult;
+import org.eclipse.milo.opcua.sdk.server.access.ReadAccessScope;
+import org.eclipse.milo.opcua.sdk.server.identity.Identity;
+import org.eclipse.milo.opcua.sdk.server.identity.Identity.AnonymousIdentity;
+import org.eclipse.milo.opcua.sdk.server.items.BaseMonitoredItem;
+import org.eclipse.milo.opcua.sdk.server.items.DataItem;
+import org.eclipse.milo.opcua.sdk.server.items.MonitoredDataItem;
+import org.eclipse.milo.opcua.sdk.server.servicesets.SubscriptionServiceSet;
+import org.eclipse.milo.opcua.sdk.server.subscriptions.Subscription;
+import org.eclipse.milo.opcua.stack.core.StatusCodes;
+import org.eclipse.milo.opcua.stack.core.UaException;
+import org.eclipse.milo.opcua.stack.core.types.builtin.DiagnosticInfo;
+import org.eclipse.milo.opcua.stack.core.types.builtin.NodeId;
+import org.eclipse.milo.opcua.stack.core.types.builtin.StatusCode;
+import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.UInteger;
+import org.eclipse.milo.opcua.stack.core.types.enumerated.MessageSecurityMode;
+import org.eclipse.milo.opcua.stack.core.types.structured.ApplicationDescription;
+import org.eclipse.milo.opcua.stack.core.types.structured.CreateSubscriptionRequest;
+import org.eclipse.milo.opcua.stack.core.types.structured.CreateSubscriptionResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.DeleteSubscriptionsRequest;
+import org.eclipse.milo.opcua.stack.core.types.structured.DeleteSubscriptionsResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.ModifySubscriptionRequest;
+import org.eclipse.milo.opcua.stack.core.types.structured.ModifySubscriptionResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.PublishRequest;
+import org.eclipse.milo.opcua.stack.core.types.structured.PublishResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.ReadValueId;
+import org.eclipse.milo.opcua.stack.core.types.structured.RepublishRequest;
+import org.eclipse.milo.opcua.stack.core.types.structured.RepublishResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.SetPublishingModeRequest;
+import org.eclipse.milo.opcua.stack.core.types.structured.SetPublishingModeResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.TransferResult;
+import org.eclipse.milo.opcua.stack.core.types.structured.TransferSubscriptionsRequest;
+import org.eclipse.milo.opcua.stack.core.types.structured.TransferSubscriptionsResponse;
+import org.eclipse.milo.opcua.stack.core.util.Lists;
+import org.eclipse.milo.opcua.stack.transport.server.ServiceRequestContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class DefaultSubscriptionServiceSet implements SubscriptionServiceSet {
+
+  private static final Logger logger = LoggerFactory.getLogger(DefaultSubscriptionServiceSet.class);
+
+  private final OpcUaServer server;
+
+  public DefaultSubscriptionServiceSet(OpcUaServer server) {
+    this.server = server;
+  }
+
+  @Override
+  public CreateSubscriptionResponse onCreateSubscription(
+      ServiceRequestContext context, CreateSubscriptionRequest request) throws UaException {
+
+    Session session = server.getSessionManager().getSession(context, request.getRequestHeader());
+
+    try {
+      return session.getSubscriptionManager().createSubscription(request).get();
+    } catch (Exception e) {
+      session.getSessionDiagnostics().getCreateSubscriptionCount().incrementErrorCount();
+      session.getSessionDiagnostics().getTotalRequestCount().incrementErrorCount();
+
+      throw new UaException(e);
+    } finally {
+      session.getSessionDiagnostics().getCreateSubscriptionCount().incrementTotalCount();
+      session.getSessionDiagnostics().getTotalRequestCount().incrementTotalCount();
+    }
+  }
+
+  @Override
+  public ModifySubscriptionResponse onModifySubscription(
+      ServiceRequestContext context, ModifySubscriptionRequest request) throws UaException {
+
+    Session session = server.getSessionManager().getSession(context, request.getRequestHeader());
+
+    try {
+      return session.getSubscriptionManager().modifySubscription(request).get();
+    } catch (Exception e) {
+      session.getSessionDiagnostics().getModifySubscriptionCount().incrementErrorCount();
+      session.getSessionDiagnostics().getTotalRequestCount().incrementErrorCount();
+
+      throw new UaException(e);
+    } finally {
+      session.getSessionDiagnostics().getModifySubscriptionCount().incrementTotalCount();
+      session.getSessionDiagnostics().getTotalRequestCount().incrementTotalCount();
+    }
+  }
+
+  @Override
+  public DeleteSubscriptionsResponse onDeleteSubscriptions(
+      ServiceRequestContext context, DeleteSubscriptionsRequest request) throws UaException {
+
+    Session session = server.getSessionManager().getSession(context, request.getRequestHeader());
+
+    try {
+      return session.getSubscriptionManager().deleteSubscriptions(request).get();
+    } catch (Exception e) {
+      session.getSessionDiagnostics().getDeleteSubscriptionsCount().incrementErrorCount();
+      session.getSessionDiagnostics().getTotalRequestCount().incrementErrorCount();
+
+      throw new UaException(e);
+    } finally {
+      session.getSessionDiagnostics().getDeleteSubscriptionsCount().incrementTotalCount();
+      session.getSessionDiagnostics().getTotalRequestCount().incrementTotalCount();
+    }
+  }
+
+  @Override
+  public TransferSubscriptionsResponse onTransferSubscriptions(
+      ServiceRequestContext context, TransferSubscriptionsRequest request) throws UaException {
+
+    Session session = server.getSessionManager().getSession(context, request.getRequestHeader());
+
+    try {
+      return transferSubscriptions(request, session).get();
+    } catch (Exception e) {
+      session.getSessionDiagnostics().getTransferSubscriptionsCount().incrementErrorCount();
+      session.getSessionDiagnostics().getTotalRequestCount().incrementErrorCount();
+
+      throw new UaException(e);
+    } finally {
+      session.getSessionDiagnostics().getTransferSubscriptionsCount().incrementTotalCount();
+      session.getSessionDiagnostics().getTotalRequestCount().incrementTotalCount();
+    }
+  }
+
+  @Override
+  public SetPublishingModeResponse onSetPublishingMode(
+      ServiceRequestContext context, SetPublishingModeRequest request) throws UaException {
+
+    Session session = server.getSessionManager().getSession(context, request.getRequestHeader());
+
+    try {
+      return session.getSubscriptionManager().setPublishingMode(request).get();
+    } catch (Exception e) {
+      session.getSessionDiagnostics().getSetPublishingModeCount().incrementErrorCount();
+      session.getSessionDiagnostics().getTotalRequestCount().incrementErrorCount();
+
+      throw new UaException(e);
+    } finally {
+      session.getSessionDiagnostics().getSetPublishingModeCount().incrementTotalCount();
+      session.getSessionDiagnostics().getTotalRequestCount().incrementTotalCount();
+    }
+  }
+
+  @Override
+  public RepublishResponse onRepublish(ServiceRequestContext context, RepublishRequest request)
+      throws UaException {
+
+    Session session = server.getSessionManager().getSession(context, request.getRequestHeader());
+
+    try {
+      return session.getSubscriptionManager().republish(request).get();
+    } catch (Exception e) {
+      session.getSessionDiagnostics().getRepublishCount().incrementErrorCount();
+      session.getSessionDiagnostics().getTotalRequestCount().incrementErrorCount();
+
+      throw new UaException(e);
+    } finally {
+      session.getSessionDiagnostics().getRepublishCount().incrementTotalCount();
+      session.getSessionDiagnostics().getTotalRequestCount().incrementTotalCount();
+    }
+  }
+
+  @Override
+  public CompletableFuture<PublishResponse> onPublish(
+      ServiceRequestContext context, PublishRequest request) {
+    Session session;
+    try {
+      session = server.getSessionManager().getSession(context, request.getRequestHeader());
+    } catch (UaException e) {
+      return CompletableFuture.failedFuture(e);
+    }
+
+    CompletableFuture<PublishResponse> future =
+        session.getSubscriptionManager().publish(context, request);
+
+    session.getSessionDiagnostics().getPublishCount().record(future);
+    session.getSessionDiagnostics().getTotalRequestCount().record(future);
+
+    return future;
+  }
+
+  private CompletableFuture<TransferSubscriptionsResponse> transferSubscriptions(
+      TransferSubscriptionsRequest request, Session session) {
+
+    List<UInteger> subscriptionIds = Lists.ofNullable(request.getSubscriptionIds());
+
+    if (subscriptionIds.isEmpty()) {
+      return failedUaFuture(StatusCodes.Bad_NothingToDo);
+    }
+
+    var results = new ArrayList<TransferResult>();
+
+    for (UInteger subscriptionId : subscriptionIds) {
+      Subscription subscription = server.getSubscriptions().get(subscriptionId);
+
+      if (subscription == null) {
+        results.add(
+            new TransferResult(
+                new StatusCode(StatusCodes.Bad_SubscriptionIdInvalid), new UInteger[0]));
+      } else {
+        Session otherSession = subscription.getSession();
+
+        if (!sessionsHaveSameUser(session, otherSession)) {
+          results.add(
+              new TransferResult(
+                  new StatusCode(StatusCodes.Bad_UserAccessDenied), new UInteger[0]));
+        } else {
+          if (session.getIdentity() instanceof AnonymousIdentity) {
+            // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.14.7
+            // If the Client uses an ANONYMOUS UserTokenType, the Server shall validate if the
+            // ApplicationUri is the same for the old and the new Session and the
+            // MessageSecurityMode is SIGN or SIGN_AND_ENCRYPT.
+
+            if (session.getEndpoint().getSecurityMode() == MessageSecurityMode.None) {
+              results.add(
+                  new TransferResult(
+                      new StatusCode(StatusCodes.Bad_UserAccessDenied), new UInteger[0]));
+              continue;
+            }
+
+            String toUri = session.getClientDescription().getApplicationUri();
+            String fromUri = otherSession.getClientDescription().getApplicationUri();
+
+            if (!Objects.equals(toUri, fromUri)) {
+              results.add(
+                  new TransferResult(
+                      new StatusCode(StatusCodes.Bad_UserAccessDenied), new UInteger[0]));
+              continue;
+            }
+          }
+
+          UInteger[] availableSequenceNumbers;
+          List<DataItem> transferredDataItems;
+          boolean overtaken;
+
+          // The items' read access results were checked for the old Session. Check them for the
+          // new one before anything is sent to it, so an initial value below, or a value from a
+          // sampler that samples its own items, is gated by an answer for the Session that
+          // receives it (Part 4 §5.13.2.1). The new Session's access epoch is read first, so an
+          // identity or endpoint change that commits during the check can be detected below.
+          long accessEpoch = session.getAccessEpoch();
+          Optional<Map<ReadValueId, AccessResult>> checked = checkReadAccess(session, subscription);
+
+          if (checked.isEmpty()) {
+            // Without an answer for the new Session, the items would keep enforcing the answers
+            // for the old one and send the new one values checked for the old one. Refuse this
+            // transfer before anything moves; the client can retry it or recreate the
+            // Subscription.
+            results.add(
+                new TransferResult(new StatusCode(StatusCodes.Bad_InternalError), new UInteger[0]));
+            continue;
+          }
+
+          Map<ReadValueId, AccessResult> readAccessResults = checked.get();
+
+          synchronized (subscription) {
+            otherSession
+                .getSubscriptionManager()
+                .sendStatusChangeNotification(
+                    subscription, new StatusCode(StatusCodes.Good_SubscriptionTransferred));
+            otherSession.getSubscriptionManager().removeSubscription(subscriptionId);
+
+            subscription.setSubscriptionManager(session.getSubscriptionManager());
+            session.getSubscriptionManager().addSubscription(subscription);
+
+            subscription.getMonitoredItems().values().forEach(item -> item.setSession(session));
+
+            // A change of the new Session that commits from here on finds the Subscription, and its
+            // refresh reads the items only after this block releases the Subscription's lock. One
+            // that committed during the check may have run its refresh before the Subscription was
+            // added, so the answers below are for the Session as it was, and the items are checked
+            // again after this block.
+            overtaken = session.getAccessEpoch() != accessEpoch;
+
+            transferredDataItems =
+                subscription.getMonitoredItems().values().stream()
+                    .filter(item -> item instanceof DataItem)
+                    .map(item -> (DataItem) item)
+                    .toList();
+
+            for (DataItem item : transferredDataItems) {
+              AccessResult result = readAccessResults.get(item.getReadValueId());
+
+              if (result == null) {
+                continue;
+              }
+
+              if (item instanceof MonitoredDataItem dataItem) {
+                // A new denial also drops the values queued for the old Session.
+                dataItem.setReadAccessResultAfterSessionChange(result);
+              } else {
+                item.setReadAccessResult(result);
+              }
+            }
+
+            availableSequenceNumbers = subscription.getAvailableSequenceNumbers();
+
+            if (request.getSendInitialValues() && !overtaken) {
+              sendInitialValues(subscription);
+            }
+          }
+
+          if (overtaken) {
+            // Outside the block, so the AccessController is not called under the Subscription's
+            // lock. The initial values wait for answers for the Session as it is.
+            recheckReadAccess(session, subscription, request.getSendInitialValues());
+          }
+
+          // Every item carries its new Session now, so the server's DataItemListeners and then
+          // the AddressSpace see the transfer complete. A failing callback must not fail a
+          // transfer that has already happened.
+          if (!transferredDataItems.isEmpty()) {
+            // The items now answer to another Session, so whatever was cached for their Nodes
+            // under this Session, if anything, may predate the transfer. Say so before the
+            // listeners hear about it.
+            List<NodeId> transferredNodeIds =
+                transferredDataItems.stream()
+                    .map(item -> item.getReadValueId().getNodeId())
+                    .distinct()
+                    .toList();
+
+            server
+                .getAccessControlManager()
+                .invalidateReadAccess(
+                    ReadAccessScope.nodes(transferredNodeIds).forSession(session));
+
+            server
+                .getDataItemListener()
+                .onDataItemsTransferred(transferredDataItems, otherSession, session);
+
+            try {
+              server.getAddressSpaceManager().onDataItemsTransferred(transferredDataItems);
+            } catch (Throwable t) {
+              logger.error("Uncaught Throwable in onDataItemsTransferred", t);
+            }
+          }
+
+          subscription.getSubscriptionDiagnostics().getTransferRequestCount().increment();
+
+          ApplicationDescription toClient = session.getClientDescription();
+          ApplicationDescription fromClient = otherSession.getClientDescription();
+
+          if (Objects.equals(toClient, fromClient)) {
+            subscription.getSubscriptionDiagnostics().getTransferredToSameClientCount().increment();
+          } else {
+            subscription.getSubscriptionDiagnostics().getTransferredToAltClientCount().increment();
+          }
+
+          results.add(new TransferResult(StatusCode.GOOD, availableSequenceNumbers));
+        }
+      }
+    }
+
+    var response =
+        new TransferSubscriptionsResponse(
+            createResponseHeader(request),
+            results.toArray(TransferResult[]::new),
+            new DiagnosticInfo[0]);
+
+    return CompletableFuture.completedFuture(response);
+  }
+
+  /**
+   * Check the read access of {@code subscription}'s data items for {@code session}, the Session it
+   * is being transferred to.
+   *
+   * @return the results, or empty if the check threw, which is logged.
+   */
+  private Optional<Map<ReadValueId, AccessResult>> checkReadAccess(
+      Session session, Subscription subscription) {
+
+    List<ReadValueId> readValueIds =
+        subscription.getMonitoredItems().values().stream()
+            .filter(item -> item instanceof DataItem)
+            .map(BaseMonitoredItem::getReadValueId)
+            .distinct()
+            .toList();
+
+    if (readValueIds.isEmpty()) {
+      return Optional.of(Map.of());
+    }
+
+    try {
+      return Optional.of(server.getAccessController().checkReadAccess(session, readValueIds));
+    } catch (Throwable t) {
+      logger.warn(
+          "Read access check failed for Subscription {} transferred to Session {}",
+          subscription.getId(),
+          session.getSessionId(),
+          t);
+
+      return Optional.empty();
+    }
+  }
+
+  /**
+   * Check {@code subscription}'s data items again for {@code session}, after an identity or
+   * endpoint change of the Session overtook the check made before the transfer, and apply each
+   * answer to an item still on the Session at the access epoch read before this check.
+   *
+   * <p>An initial value is sent, if requested, only for an item that got a decision here. An item
+   * whose check failed, answered no decision, or was overtaken again keeps the answer for the
+   * Session as it was, and nothing sampled for that Session is sent on it; the refresh of a change
+   * that overtook this check applies the answer for that change.
+   */
+  private void recheckReadAccess(
+      Session session, Subscription subscription, boolean sendInitialValues) {
+
+    long accessEpoch = session.getAccessEpoch();
+    Map<ReadValueId, AccessResult> results =
+        checkReadAccess(session, subscription).orElse(Map.of());
+
+    for (BaseMonitoredItem<?> item : subscription.getMonitoredItems().values()) {
+      AccessResult result = results.get(item.getReadValueId());
+
+      if (result == null || !result.isDecision()) {
+        continue;
+      }
+
+      if (item instanceof MonitoredDataItem dataItem) {
+        boolean applied;
+
+        // Under the item's lock, like the refresh this stands in for, so the answer of a change
+        // that overtook this check is never replaced. A new denial also drops the values queued
+        // for the Session as it was.
+        synchronized (dataItem) {
+          applied = dataItem.getSession() == session && session.getAccessEpoch() == accessEpoch;
+
+          if (applied) {
+            dataItem.setReadAccessResultAfterSessionChange(result);
+          }
+        }
+
+        if (applied && sendInitialValues) {
+          dataItem.maybeSendLastValue();
+        }
+      } else if (item instanceof DataItem dataItem) {
+        dataItem.setReadAccessResult(result, session, accessEpoch);
+      }
+    }
+  }
+
+  private static void sendInitialValues(Subscription subscription) {
+    subscription.getMonitoredItems().values().stream()
+        .filter(item -> item instanceof MonitoredDataItem)
+        .map(item -> (MonitoredDataItem) item)
+        .forEach(MonitoredDataItem::maybeSendLastValue);
+  }
+
+  private static boolean sessionsHaveSameUser(Session s1, Session s2) {
+    Identity i1 = s1.getIdentity();
+    Identity i2 = s2.getIdentity();
+    return i1 != null && i2 != null && i1.equalTo(i2);
+  }
+}

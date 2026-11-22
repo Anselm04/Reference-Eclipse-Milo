@@ -1,0 +1,350 @@
+/*
+ * Copyright (c) 2025 the Eclipse Milo Authors
+ *
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ */
+
+package org.eclipse.milo.opcua.stack.core.util;
+
+import static java.util.Objects.requireNonNullElse;
+
+import java.math.BigInteger;
+import java.security.GeneralSecurityException;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.NoSuchAlgorithmException;
+import java.security.Provider;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
+import java.security.spec.ECGenParameterSpec;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Locale;
+import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.asn1.x500.X500NameBuilder;
+import org.bouncycastle.asn1.x500.style.BCStyle;
+import org.bouncycastle.asn1.x509.BasicConstraints;
+import org.bouncycastle.asn1.x509.ExtendedKeyUsage;
+import org.bouncycastle.asn1.x509.Extension;
+import org.bouncycastle.asn1.x509.GeneralName;
+import org.bouncycastle.asn1.x509.GeneralNames;
+import org.bouncycastle.asn1.x509.KeyPurposeId;
+import org.bouncycastle.asn1.x509.KeyUsage;
+import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
+import org.bouncycastle.cert.CertIOException;
+import org.bouncycastle.cert.X509CertificateHolder;
+import org.bouncycastle.cert.X509v3CertificateBuilder;
+import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
+import org.bouncycastle.cert.jcajce.JcaX509ExtensionUtils;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.bouncycastle.operator.ContentSigner;
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
+import org.jspecify.annotations.Nullable;
+
+public class SelfSignedCertificateGenerator {
+
+  /**
+   * Generate an RSA {@link KeyPair} of bit length {@code length}.
+   *
+   * @param length the length, in bits, of the key to generate.
+   * @return a {@link KeyPair} of bit length {@code length}.
+   * @throws NoSuchAlgorithmException if no {@link Provider} supports RSA KeyPair generation.
+   */
+  public static KeyPair generateRsaKeyPair(int length) throws NoSuchAlgorithmException {
+    KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+    generator.initialize(length, new SecureRandom());
+
+    return generator.generateKeyPair();
+  }
+
+  /**
+   * Generate an EC {@link KeyPair} of bit length {@code length}.
+   *
+   * @param length the length, in bits, of the key to generate.
+   * @return a {@link KeyPair} of bit length {@code length}.
+   * @throws NoSuchAlgorithmException if no {@link Provider} supports EC KeyPair generation.
+   */
+  public static KeyPair generateEcKeyPair(int length) throws NoSuchAlgorithmException {
+    KeyPairGenerator generator = KeyPairGenerator.getInstance("EC");
+    generator.initialize(length, new SecureRandom());
+
+    return generator.generateKeyPair();
+  }
+
+  /**
+   * Generate an EC {@link KeyPair} for the named curve {@code curveName}.
+   *
+   * @param curveName the standard curve name, e.g. {@code secp256r1}.
+   * @return a {@link KeyPair} for {@code curveName}.
+   * @throws GeneralSecurityException if no provider supports EC generation for {@code curveName}.
+   */
+  public static KeyPair generateEcKeyPair(String curveName) throws GeneralSecurityException {
+    KeyPairGenerator generator = KeyPairGenerator.getInstance("EC");
+    generator.initialize(new ECGenParameterSpec(curveName), new SecureRandom());
+
+    return generator.generateKeyPair();
+  }
+
+  /**
+   * Generate a NIST P-256 EC {@link KeyPair}.
+   *
+   * @return a NIST P-256 {@link KeyPair}.
+   * @throws GeneralSecurityException if no provider supports NIST P-256 generation.
+   */
+  public static KeyPair generateNistP256KeyPair() throws GeneralSecurityException {
+    return generateEcKeyPair("secp256r1");
+  }
+
+  /**
+   * Generate a NIST P-384 EC {@link KeyPair}.
+   *
+   * @return a NIST P-384 {@link KeyPair}.
+   * @throws GeneralSecurityException if no provider supports NIST P-384 generation.
+   */
+  public static KeyPair generateNistP384KeyPair() throws GeneralSecurityException {
+    return generateEcKeyPair("secp384r1");
+  }
+
+  /**
+   * Generate a Brainpool P-256r1 EC {@link KeyPair}.
+   *
+   * @return a Brainpool P-256r1 {@link KeyPair}.
+   * @throws GeneralSecurityException if no provider supports Brainpool P-256r1 generation.
+   */
+  public static KeyPair generateBrainpoolP256r1KeyPair() throws GeneralSecurityException {
+    KeyPairGenerator generator = KeyPairGenerator.getInstance("EC", new BouncyCastleProvider());
+    generator.initialize(new ECGenParameterSpec("brainpoolP256r1"), new SecureRandom());
+
+    return generator.generateKeyPair();
+  }
+
+  /**
+   * Generate a Brainpool P-384r1 EC {@link KeyPair}.
+   *
+   * @return a Brainpool P-384r1 {@link KeyPair}.
+   * @throws GeneralSecurityException if no provider supports Brainpool P-384r1 generation.
+   */
+  public static KeyPair generateBrainpoolP384r1KeyPair() throws GeneralSecurityException {
+    KeyPairGenerator generator = KeyPairGenerator.getInstance("EC", new BouncyCastleProvider());
+    generator.initialize(new ECGenParameterSpec("brainpoolP384r1"), new SecureRandom());
+
+    return generator.generateKeyPair();
+  }
+
+  /**
+   * Generate an Ed25519 {@link KeyPair}.
+   *
+   * @return an Ed25519 {@link KeyPair}.
+   * @throws NoSuchAlgorithmException if no provider supports Ed25519 generation.
+   */
+  public static KeyPair generateEd25519KeyPair() throws NoSuchAlgorithmException {
+    KeyPairGenerator generator = KeyPairGenerator.getInstance("Ed25519");
+
+    return generator.generateKeyPair();
+  }
+
+  /**
+   * Generate an Ed448 {@link KeyPair}.
+   *
+   * @return an Ed448 {@link KeyPair}.
+   * @throws NoSuchAlgorithmException if no provider supports Ed448 generation.
+   */
+  public static KeyPair generateEd448KeyPair() throws NoSuchAlgorithmException {
+    KeyPairGenerator generator = KeyPairGenerator.getInstance("Ed448");
+
+    return generator.generateKeyPair();
+  }
+
+  /**
+   * Create a generator for ECC and Edwards-curve application instance certificates.
+   *
+   * <p>The generated certificates include only the ECC/Edwards application-certificate KeyUsage
+   * bits required by OPC UA Part 6 for self-signed certificates: {@code digitalSignature} and
+   * {@code keyCertSign}. ExtendedKeyUsage is omitted.
+   *
+   * @return a generator for ECC and Edwards-curve application instance certificates.
+   */
+  public static SelfSignedCertificateGenerator eccApplicationCertificateGenerator() {
+    return new EccApplicationCertificateGenerator();
+  }
+
+  public X509Certificate generateSelfSigned(
+      KeyPair keyPair,
+      Date notBefore,
+      Date notAfter,
+      String commonName,
+      String organization,
+      @Nullable String organizationalUnit,
+      @Nullable String localityName,
+      @Nullable String stateName,
+      @Nullable String countryCode,
+      @Nullable String applicationUri,
+      List<String> dnsNames,
+      List<String> ipAddresses,
+      String signatureAlgorithm)
+      throws Exception {
+
+    X500NameBuilder nameBuilder = new X500NameBuilder();
+
+    // Common Name and Organization are required attributes.
+    nameBuilder.addRDN(BCStyle.CN, requireNonNullElse(commonName, "not configured"));
+    nameBuilder.addRDN(BCStyle.O, requireNonNullElse(organization, "not configured"));
+
+    // Optional attributes; only add if non-null and non-empty.
+
+    if (organizationalUnit != null && !organizationalUnit.isEmpty()) {
+      nameBuilder.addRDN(BCStyle.OU, organizationalUnit);
+    }
+    if (localityName != null && !localityName.isEmpty()) {
+      nameBuilder.addRDN(BCStyle.L, localityName);
+    }
+    if (stateName != null && !stateName.isEmpty()) {
+      nameBuilder.addRDN(BCStyle.ST, stateName);
+    }
+    if (countryCode != null && !countryCode.isEmpty()) {
+      nameBuilder.addRDN(BCStyle.C, countryCode);
+    }
+
+    X500Name name = nameBuilder.build();
+
+    // Using the current timestamp as the certificate serial number
+    BigInteger certSerialNumber = new BigInteger(Long.toString(System.currentTimeMillis()));
+
+    SubjectPublicKeyInfo subjectPublicKeyInfo =
+        SubjectPublicKeyInfo.getInstance(keyPair.getPublic().getEncoded());
+
+    X509v3CertificateBuilder certificateBuilder =
+        new X509v3CertificateBuilder(
+            name,
+            certSerialNumber,
+            notBefore,
+            notAfter,
+            Locale.ENGLISH,
+            name,
+            subjectPublicKeyInfo);
+
+    BasicConstraints basicConstraints = new BasicConstraints(false);
+
+    // Authority Key Identifier
+    addAuthorityKeyIdentifier(certificateBuilder, keyPair);
+
+    // Basic Constraints
+    addBasicConstraints(certificateBuilder, basicConstraints);
+
+    // Key Usage
+    addKeyUsage(certificateBuilder);
+
+    // Extended Key Usage
+    addExtendedKeyUsage(certificateBuilder);
+
+    // Subject Alternative Name
+    addSubjectAlternativeNames(certificateBuilder, keyPair, applicationUri, dnsNames, ipAddresses);
+
+    ContentSigner contentSigner =
+        new JcaContentSignerBuilder(signatureAlgorithm)
+            .setProvider(new BouncyCastleProvider())
+            .build(keyPair.getPrivate());
+
+    X509CertificateHolder certificateHolder = certificateBuilder.build(contentSigner);
+
+    return new JcaX509CertificateConverter().getCertificate(certificateHolder);
+  }
+
+  protected void addSubjectAlternativeNames(
+      X509v3CertificateBuilder certificateBuilder,
+      KeyPair keyPair,
+      @Nullable String applicationUri,
+      List<String> dnsNames,
+      List<String> ipAddresses)
+      throws CertIOException, NoSuchAlgorithmException {
+
+    List<GeneralName> generalNames = new ArrayList<>();
+
+    if (applicationUri != null) {
+      generalNames.add(new GeneralName(GeneralName.uniformResourceIdentifier, applicationUri));
+    }
+
+    dnsNames.stream()
+        .distinct()
+        .map(s -> new GeneralName(GeneralName.dNSName, s))
+        .forEach(generalNames::add);
+
+    ipAddresses.stream()
+        .distinct()
+        .map(s -> new GeneralName(GeneralName.iPAddress, s))
+        .forEach(generalNames::add);
+
+    certificateBuilder.addExtension(
+        Extension.subjectAlternativeName,
+        false,
+        new GeneralNames(generalNames.toArray(new GeneralName[] {})));
+
+    // Subject Key Identifier
+    certificateBuilder.addExtension(
+        Extension.subjectKeyIdentifier,
+        false,
+        new JcaX509ExtensionUtils().createSubjectKeyIdentifier(keyPair.getPublic()));
+  }
+
+  protected void addExtendedKeyUsage(X509v3CertificateBuilder certificateBuilder)
+      throws CertIOException {
+    certificateBuilder.addExtension(
+        Extension.extendedKeyUsage,
+        false,
+        new ExtendedKeyUsage(
+            new KeyPurposeId[] {KeyPurposeId.id_kp_clientAuth, KeyPurposeId.id_kp_serverAuth}));
+  }
+
+  protected void addKeyUsage(X509v3CertificateBuilder certificateBuilder) throws CertIOException {
+    certificateBuilder.addExtension(
+        Extension.keyUsage,
+        false,
+        new KeyUsage(
+            KeyUsage.dataEncipherment
+                | KeyUsage.digitalSignature
+                | KeyUsage.keyCertSign
+                | KeyUsage.keyEncipherment
+                | KeyUsage.nonRepudiation));
+  }
+
+  protected void addBasicConstraints(
+      X509v3CertificateBuilder certificateBuilder, BasicConstraints basicConstraints)
+      throws CertIOException {
+
+    certificateBuilder.addExtension(Extension.basicConstraints, false, basicConstraints);
+  }
+
+  protected void addAuthorityKeyIdentifier(
+      X509v3CertificateBuilder certificateBuilder, KeyPair keyPair)
+      throws CertIOException, NoSuchAlgorithmException {
+
+    certificateBuilder.addExtension(
+        Extension.authorityKeyIdentifier,
+        false,
+        new JcaX509ExtensionUtils().createAuthorityKeyIdentifier(keyPair.getPublic()));
+  }
+
+  private static final class EccApplicationCertificateGenerator
+      extends SelfSignedCertificateGenerator {
+
+    @Override
+    protected void addExtendedKeyUsage(X509v3CertificateBuilder certificateBuilder) {
+      // OPC 10000-6, 6.2.2 makes serverAuth/clientAuth ExtendedKeyUsage optional for ECC
+      // profiles, so omit the RSA/default EKU extension:
+      // https://reference.opcfoundation.org/specs/OPC-10000-6/6.2.2/
+    }
+
+    @Override
+    protected void addKeyUsage(X509v3CertificateBuilder certificateBuilder) throws CertIOException {
+      certificateBuilder.addExtension(
+          Extension.keyUsage,
+          false,
+          new KeyUsage(KeyUsage.digitalSignature | KeyUsage.keyCertSign));
+    }
+  }
+}

@@ -1,0 +1,421 @@
+/*
+ * Copyright (c) 2025 the Eclipse Milo Authors
+ *
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ */
+
+package org.eclipse.milo.opcua.sdk.client;
+
+import static org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.ubyte;
+import static org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.uint;
+import static org.eclipse.milo.opcua.stack.core.util.FutureUtils.failedFuture;
+
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.function.Consumer;
+import org.eclipse.milo.opcua.sdk.client.reverse.ReverseConnectConnection;
+import org.eclipse.milo.opcua.sdk.client.reverse.ReverseTcpClientTransport;
+import org.eclipse.milo.opcua.stack.core.Stack;
+import org.eclipse.milo.opcua.stack.core.StatusCodes;
+import org.eclipse.milo.opcua.stack.core.UaException;
+import org.eclipse.milo.opcua.stack.core.encoding.DefaultEncodingContext;
+import org.eclipse.milo.opcua.stack.core.encoding.EncodingContext;
+import org.eclipse.milo.opcua.stack.core.security.CertificateIdentity;
+import org.eclipse.milo.opcua.stack.core.security.CertificateValidator;
+import org.eclipse.milo.opcua.stack.core.security.SecurityPolicy;
+import org.eclipse.milo.opcua.stack.core.security.SecurityPolicyProfile;
+import org.eclipse.milo.opcua.stack.core.types.builtin.DateTime;
+import org.eclipse.milo.opcua.stack.core.types.builtin.NodeId;
+import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.UInteger;
+import org.eclipse.milo.opcua.stack.core.types.enumerated.MessageSecurityMode;
+import org.eclipse.milo.opcua.stack.core.types.structured.ApplicationDescription;
+import org.eclipse.milo.opcua.stack.core.types.structured.EndpointDescription;
+import org.eclipse.milo.opcua.stack.core.types.structured.FindServersRequest;
+import org.eclipse.milo.opcua.stack.core.types.structured.FindServersResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.GetEndpointsRequest;
+import org.eclipse.milo.opcua.stack.core.types.structured.GetEndpointsResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.RegisterServerRequest;
+import org.eclipse.milo.opcua.stack.core.types.structured.RegisterServerResponse;
+import org.eclipse.milo.opcua.stack.core.types.structured.RegisteredServer;
+import org.eclipse.milo.opcua.stack.core.types.structured.RequestHeader;
+import org.eclipse.milo.opcua.stack.core.util.EndpointUtil;
+import org.eclipse.milo.opcua.stack.core.util.Lists;
+import org.eclipse.milo.opcua.stack.transport.client.ClientApplicationContext;
+import org.eclipse.milo.opcua.stack.transport.client.OpcClientTransport;
+import org.eclipse.milo.opcua.stack.transport.client.tcp.OpcTcpClientTransport;
+import org.eclipse.milo.opcua.stack.transport.client.tcp.OpcTcpClientTransportConfig;
+import org.eclipse.milo.opcua.stack.transport.client.tcp.OpcTcpClientTransportConfigBuilder;
+
+public class DiscoveryClient {
+
+  private final ClientApplicationContext applicationContext;
+  private final OpcClientTransport transport;
+
+  public DiscoveryClient(EndpointDescription endpoint, OpcClientTransport transport) {
+    this.transport = transport;
+
+    applicationContext =
+        new ClientApplicationContext() {
+          @Override
+          public EndpointDescription getEndpoint() {
+            return endpoint;
+          }
+
+          @Override
+          public Optional<CertificateIdentity> getCertificateIdentity(
+              SecurityPolicyProfile securityPolicyProfile) {
+
+            return Optional.empty();
+          }
+
+          @Override
+          public CertificateValidator getCertificateValidator() {
+            return new CertificateValidator.InsecureCertificateValidator();
+          }
+
+          @Override
+          public EncodingContext getEncodingContext() {
+            return DefaultEncodingContext.INSTANCE;
+          }
+
+          @Override
+          public UInteger getRequestTimeout() {
+            return uint(60_000);
+          }
+        };
+  }
+
+  public DiscoveryClient connect() throws UaException {
+    try {
+      return connectAsync().get();
+    } catch (ExecutionException e) {
+      throw new UaException(e.getCause());
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new UaException(StatusCodes.Bad_UnexpectedError, e);
+    }
+  }
+
+  public CompletableFuture<DiscoveryClient> connectAsync() {
+    return transport.connect(applicationContext).thenApply(c -> DiscoveryClient.this);
+  }
+
+  public DiscoveryClient disconnect() throws UaException {
+    try {
+      return disconnectAsync().get();
+    } catch (ExecutionException e) {
+      throw new UaException(e.getCause());
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new UaException(StatusCodes.Bad_UnexpectedError, e);
+    }
+  }
+
+  public CompletableFuture<DiscoveryClient> disconnectAsync() {
+    return transport.disconnect().thenApply(c -> DiscoveryClient.this);
+  }
+
+  /**
+   * Query the FindServers service at the {@code endpointUrl}.
+   *
+   * <p>The endpoint URL(s) for each server {@link ApplicationDescription} in the response can then
+   * be used in a {@link #getEndpoints(String)} call to discover the endpoints for that server.
+   *
+   * @param endpointUrl the endpoint URL to find servers at.
+   * @param localeIds list of locales to use. The server should return the applicationName in the
+   *     ApplicationDescription using one of locales specified. If the server supports more than one
+   *     of the requested locales then the server shall use the locale that appears first in this
+   *     list. If the server does not support any of the requested locales it chooses an appropriate
+   *     default locale. The server chooses an appropriate default locale if this list is empty.
+   * @param serverUris list of servers to return. All known servers are returned if the list is
+   *     empty.
+   * @return the {@link FindServersResponse}s returned by the FindServers service.
+   */
+  public CompletableFuture<FindServersResponse> findServers(
+      String endpointUrl, String[] localeIds, String[] serverUris) {
+
+    RequestHeader requestHeader = newRequestHeader(NodeId.NULL_VALUE, uint(60_000));
+
+    FindServersRequest request =
+        new FindServersRequest(requestHeader, endpointUrl, localeIds, serverUris);
+
+    return transport.sendRequestMessage(request).thenApply(FindServersResponse.class::cast);
+  }
+
+  /**
+   * Query the GetEndpoints service at {@code endpointUrl}.
+   *
+   * @param endpointUrl the endpoint URL to get endpoints from.
+   * @param localeIds list of locales to use. Specifies the locale to use when returning
+   *     human-readable strings.
+   * @param profileUris list of Transport Profile that the returned Endpoints shall support. All
+   *     Endpoints are returned if the list is empty.
+   * @return the {@link GetEndpointsResponse} returned by the GetEndpoints service.
+   */
+  public CompletableFuture<GetEndpointsResponse> getEndpoints(
+      String endpointUrl, String[] localeIds, String[] profileUris) {
+
+    RequestHeader header = newRequestHeader(NodeId.NULL_VALUE, uint(60_000));
+
+    GetEndpointsRequest request =
+        new GetEndpointsRequest(header, endpointUrl, localeIds, profileUris);
+
+    return transport.sendRequestMessage(request).thenApply(GetEndpointsResponse.class::cast);
+  }
+
+  /**
+   * Call the RegisterServer service to register {@code server}.
+   *
+   * @param server the {@link RegisteredServer} to register.
+   * @return the {@link RegisterServerResponse} returned by the RegisterServer service.
+   */
+  public CompletableFuture<RegisterServerResponse> registerServer(RegisteredServer server) {
+    RequestHeader header = newRequestHeader(NodeId.NULL_VALUE, uint(60_000));
+
+    var request = new RegisterServerRequest(header, server);
+
+    return transport.sendRequestMessage(request).thenApply(RegisterServerResponse.class::cast);
+  }
+
+  public RequestHeader newRequestHeader(NodeId authToken, UInteger requestTimeout) {
+    return new RequestHeader(
+        authToken, DateTime.now(), uint(0), uint(0), null, requestTimeout, null);
+  }
+
+  /**
+   * Query the FindServers service at the {@code endpointUrl}.
+   *
+   * <p>The discovery URL(s) for each server {@link ApplicationDescription} in the response can then
+   * be used in a {@link #getEndpoints(String)} call to discover the endpoints for that server.
+   *
+   * @param endpointUrl the endpoint URL to find servers at.
+   * @return a List of {@link ApplicationDescription}s returned by the FindServers service.
+   */
+  public static CompletableFuture<List<ApplicationDescription>> findServers(String endpointUrl) {
+    return findServers(endpointUrl, b -> {});
+  }
+
+  /**
+   * Query the FindServers service at the {@code endpointUrl}.
+   *
+   * <p>The discovery URL(s) for each server {@link ApplicationDescription} in the response can then
+   * be used in a {@link #getEndpoints(String)} call to discover the endpoints for that server.
+   *
+   * @param endpointUrl the endpoint URL to find servers at.
+   * @param customizer a {@link Consumer} that accepts a {@link OpcTcpClientTransportConfigBuilder}
+   *     for customization.
+   * @return a List of {@link ApplicationDescription}s returned by the FindServers service.
+   */
+  public static CompletableFuture<List<ApplicationDescription>> findServers(
+      String endpointUrl, Consumer<OpcTcpClientTransportConfigBuilder> customizer) {
+
+    EndpointDescription endpoint =
+        new EndpointDescription(
+            endpointUrl,
+            null,
+            null,
+            MessageSecurityMode.None,
+            SecurityPolicy.None.getUri(),
+            null,
+            Stack.TCP_UASC_UABINARY_TRANSPORT_URI,
+            ubyte(0));
+
+    OpcTcpClientTransportConfigBuilder configBuilder = OpcTcpClientTransportConfig.newBuilder();
+    customizer.accept(configBuilder);
+
+    OpcTcpClientTransportConfig config = configBuilder.build();
+    var transport = new OpcTcpClientTransport(config);
+
+    DiscoveryClient discoveryClient = new DiscoveryClient(endpoint, transport);
+
+    return discoveryClient
+        .connectAsync()
+        .thenCompose(c -> c.findServers(endpointUrl, new String[0], new String[0]))
+        .whenComplete((e, ex) -> discoveryClient.disconnectAsync())
+        .thenApply(response -> Lists.ofNullable(response.getServers()));
+  }
+
+  /**
+   * Query the GetEndpoints service at {@code endpointUrl}.
+   *
+   * @param endpointUrl the endpoint URL to get endpoints from.
+   * @return a List of {@link EndpointDescription}s returned by the GetEndpoints service.
+   */
+  public static CompletableFuture<List<EndpointDescription>> getEndpoints(String endpointUrl) {
+    return getEndpoints(endpointUrl, b -> {});
+  }
+
+  /**
+   * Query the GetEndpoints service at {@code endpointUrl}.
+   *
+   * @param endpointUrl the endpoint URL to get endpoints from.
+   * @param customizer a {@link Consumer} that accepts a {@link OpcTcpClientTransportConfigBuilder}
+   *     for customization.
+   * @return a List of {@link EndpointDescription}s returned by the GetEndpoints service.
+   */
+  public static CompletableFuture<List<EndpointDescription>> getEndpoints(
+      String endpointUrl, Consumer<OpcTcpClientTransportConfigBuilder> customizer) {
+
+    String profileUri;
+    try {
+      profileUri = transportProfileUri(endpointUrl);
+    } catch (UaException e) {
+      return failedFuture(e);
+    }
+
+    return getEndpoints(endpointUrl, profileUri, customizer);
+  }
+
+  /**
+   * Map the scheme of {@code endpointUrl} to the transport profile URI that GetEndpoints results
+   * are filtered by.
+   *
+   * @param endpointUrl the endpoint URL whose scheme selects the profile.
+   * @return the transport profile URI.
+   * @throws UaException if the scheme is not supported.
+   */
+  static String transportProfileUri(String endpointUrl) throws UaException {
+    String scheme = EndpointUtil.getScheme(endpointUrl);
+
+    return switch (Objects.requireNonNullElse(scheme, "").toLowerCase()) {
+      case "opc.tcp" -> Stack.TCP_UASC_UABINARY_TRANSPORT_URI;
+      case "http", "https", "opc.http", "opc.https" -> Stack.HTTPS_UABINARY_TRANSPORT_URI;
+      case "opc.ws", "opc.wss" -> Stack.WSS_UASC_UABINARY_TRANSPORT_URI;
+      default ->
+          throw new UaException(StatusCodes.Bad_InternalError, "unsupported protocol: " + scheme);
+    };
+  }
+
+  private static CompletableFuture<List<EndpointDescription>> getEndpoints(
+      String endpointUrl,
+      String profileUri,
+      Consumer<OpcTcpClientTransportConfigBuilder> customizer) {
+
+    EndpointDescription endpoint = newDiscoveryEndpoint(endpointUrl, profileUri);
+
+    OpcTcpClientTransportConfigBuilder configBuilder = OpcTcpClientTransportConfig.newBuilder();
+    customizer.accept(configBuilder);
+
+    OpcTcpClientTransportConfig config = configBuilder.build();
+    var transport = new OpcTcpClientTransport(config);
+
+    DiscoveryClient discoveryClient = new DiscoveryClient(endpoint, transport);
+
+    return discoveryClient
+        .connectAsync()
+        .thenCompose(c -> c.getEndpoints(endpointUrl, new String[0], new String[] {profileUri}))
+        .whenComplete((e, ex) -> discoveryClient.disconnectAsync())
+        .thenApply(response -> Lists.ofNullable(response.getEndpoints()));
+  }
+
+  /**
+   * Query the GetEndpoints service over a claimed Reverse Connect channel.
+   *
+   * <p>This helper is for dynamic Reverse Connect applications that receive a server-opened socket
+   * before they have a usable {@link EndpointDescription}. It consumes {@code connection}, opens a
+   * provisional no-security UA-TCP discovery SecureChannel using the endpoint URL from {@code
+   * ReverseHello}, calls GetEndpoints, and disconnects the discovery transport when the request
+   * completes or fails.
+   *
+   * <p>The discovery connection is one-shot and is not reused for the production Session. Use the
+   * selected endpoint from the returned list to create a normal reverse {@link OpcUaClient} that
+   * waits for a later matching reverse connection.
+   *
+   * <p>If the claimed connection does not carry a usable endpoint URL, the returned future fails
+   * with {@link StatusCodes#Bad_TcpEndpointUrlInvalid} after the claimed channel is closed.
+   *
+   * @param connection the claimed Reverse Connect connection to consume for discovery.
+   * @return a List of {@link EndpointDescription}s returned by the GetEndpoints service.
+   */
+  public static CompletableFuture<List<EndpointDescription>> getEndpoints(
+      ReverseConnectConnection connection) {
+
+    return getEndpoints(connection, b -> {});
+  }
+
+  /**
+   * Query the GetEndpoints service over a claimed Reverse Connect channel.
+   *
+   * <p>This overload allows customization of the direct reverse TCP transport used for the
+   * provisional discovery SecureChannel. The supplied connection is still consumed exactly once and
+   * the helper disconnects the discovery transport on completion.
+   *
+   * <p>If the transport customizer throws a runtime exception, the claimed channel is closed and
+   * the returned future fails with that exception.
+   *
+   * @param connection the claimed Reverse Connect connection to consume for discovery.
+   * @param customizer a {@link Consumer} that accepts a {@link OpcTcpClientTransportConfigBuilder}
+   *     for customization.
+   * @return a List of {@link EndpointDescription}s returned by the GetEndpoints service.
+   */
+  public static CompletableFuture<List<EndpointDescription>> getEndpoints(
+      ReverseConnectConnection connection,
+      Consumer<OpcTcpClientTransportConfigBuilder> customizer) {
+
+    Objects.requireNonNull(connection, "connection");
+
+    String endpointUrl = connection.endpointUrl();
+    if (endpointUrl == null || endpointUrl.isBlank()) {
+      connection.close();
+      return failedFuture(
+          new UaException(
+              StatusCodes.Bad_TcpEndpointUrlInvalid, "ReverseHello endpointUrl is null or blank"));
+    }
+
+    OpcTcpClientTransportConfigBuilder configBuilder = OpcTcpClientTransportConfig.newBuilder();
+    DiscoveryClient discoveryClient;
+
+    try {
+      customizer.accept(configBuilder);
+      EndpointDescription endpoint =
+          newDiscoveryEndpoint(endpointUrl, Stack.TCP_UASC_UABINARY_TRANSPORT_URI);
+      OpcTcpClientTransportConfig config = configBuilder.build();
+      var transport = new ReverseTcpClientTransport(config, connection);
+      discoveryClient = new DiscoveryClient(endpoint, transport);
+    } catch (RuntimeException e) {
+      connection.close();
+      return failedFuture(e);
+    }
+
+    return discoveryClient
+        .connectAsync()
+        .thenCompose(
+            c ->
+                c.getEndpoints(
+                    endpointUrl,
+                    new String[0],
+                    new String[] {Stack.TCP_UASC_UABINARY_TRANSPORT_URI}))
+        .whenComplete((e, ex) -> discoveryClient.disconnectAsync())
+        .thenApply(response -> Lists.ofNullable(response.getEndpoints()));
+  }
+
+  /**
+   * Build the provisional no-security endpoint used by discovery helpers.
+   *
+   * <p>Discovery clients use this synthetic endpoint only to open a temporary SecureChannel for
+   * FindServers or GetEndpoints. It is not a selected production endpoint and carries no server
+   * identity or user-token policy information.
+   *
+   * @param endpointUrl the endpoint URL used for the discovery request and client Hello.
+   * @param profileUri the transport profile advertised for the temporary discovery channel.
+   * @return the provisional discovery endpoint.
+   */
+  static EndpointDescription newDiscoveryEndpoint(String endpointUrl, String profileUri) {
+    return new EndpointDescription(
+        endpointUrl,
+        null,
+        null,
+        MessageSecurityMode.None,
+        SecurityPolicy.None.getUri(),
+        null,
+        profileUri,
+        ubyte(0));
+  }
+}

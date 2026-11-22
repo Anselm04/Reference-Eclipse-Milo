@@ -1,0 +1,102 @@
+/*
+ * Copyright (c) 2025 the Eclipse Milo Authors
+ *
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ */
+
+package org.eclipse.milo.opcua.stack.core;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.util.stream.Stream;
+import org.eclipse.milo.opcua.stack.core.types.builtin.ExtensionObject;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
+
+class OpcUaDataTypeTest {
+
+  @Test
+  void fromBackingClass() {
+    for (OpcUaDataType dataType : OpcUaDataType.values()) {
+      Class<?> backingClass = dataType.getBackingClass();
+      OpcUaDataType fromBackingClass = OpcUaDataType.fromBackingClass(backingClass);
+
+      assertEquals(
+          dataType,
+          fromBackingClass,
+          "%s should return %s".formatted(backingClass.getName(), dataType));
+    }
+  }
+
+  @Test
+  void fromTypeId() {
+    for (OpcUaDataType dataType : OpcUaDataType.values()) {
+      assertEquals(
+          dataType,
+          OpcUaDataType.fromTypeId(dataType.getTypeId()),
+          "type id %d should return %s".formatted(dataType.getTypeId(), dataType));
+    }
+  }
+
+  // The binary and JSON decoders pass the type id read from a Matrix on the wire straight in, and
+  // build the Matrix with whatever comes back, so an id outside the builtin range must be null
+  // rather than throw or resolve to a neighbouring type.
+  @ParameterizedTest
+  @ValueSource(ints = {0, 26, -1, Integer.MIN_VALUE, Integer.MAX_VALUE})
+  void fromTypeIdReturnsNullForUnknownIds(int typeId) {
+    assertNull(OpcUaDataType.fromTypeId(typeId));
+  }
+
+  @ParameterizedTest
+  @MethodSource("extensionObjectSubtypeBackingClasses")
+  void fromBackingClassExtensionObjects(Class<?> clazz) {
+    assertEquals(
+        OpcUaDataType.ExtensionObject,
+        OpcUaDataType.fromBackingClass(clazz),
+        "%s should return OpcUaDataType.ExtensionObject".formatted(clazz.getName()));
+  }
+
+  @ParameterizedTest
+  @MethodSource("allBackingClasses")
+  void isBuiltin(Class<?> clazz) {
+    assertTrue(
+        OpcUaDataType.isBuiltin(clazz),
+        clazz.getSimpleName() + " should be recognized as a built-in type");
+  }
+
+  // Callers branch on a -1 sentinel (Variant.getDataTypeId, OpcUaBinaryEncoder.encodeVariant), so
+  // an unknown class must return -1 rather than throwing on an unboxed null.
+  @Test
+  void getBuiltinTypeIdReturnsMinusOneForNonBuiltinClass() {
+    assertEquals(-1, OpcUaDataType.getBuiltinTypeId(Object.class));
+    assertEquals(-1, OpcUaDataType.getBuiltinTypeId(java.util.List.class));
+  }
+
+  @ParameterizedTest
+  @MethodSource("allBackingClasses")
+  void getBuiltinTypeIdResolvesBackingClasses(Class<?> clazz) {
+    assertNotEquals(
+        -1,
+        OpcUaDataType.getBuiltinTypeId(clazz),
+        clazz.getSimpleName() + " should resolve to a built-in type id");
+  }
+
+  private static Stream<Class<?>> allBackingClasses() {
+    return Stream.concat(standardBackingClasses(), extensionObjectSubtypeBackingClasses());
+  }
+
+  private static Stream<Class<?>> standardBackingClasses() {
+    return Stream.of(OpcUaDataType.values()).map(OpcUaDataType::getBackingClass);
+  }
+
+  private static Stream<Class<?>> extensionObjectSubtypeBackingClasses() {
+    return Stream.of(
+        ExtensionObject.Binary.class, ExtensionObject.Xml.class, ExtensionObject.Json.class);
+  }
+}

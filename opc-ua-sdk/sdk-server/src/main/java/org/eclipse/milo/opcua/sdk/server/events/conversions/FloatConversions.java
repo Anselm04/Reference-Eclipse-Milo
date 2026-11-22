@@ -1,0 +1,179 @@
+/*
+ * Copyright (c) 2024 the Eclipse Milo Authors
+ *
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ */
+
+package org.eclipse.milo.opcua.sdk.server.events.conversions;
+
+import static org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.ubyte;
+import static org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.uint;
+import static org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.ulong;
+import static org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.ushort;
+
+import org.eclipse.milo.opcua.stack.core.OpcUaDataType;
+import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.UByte;
+import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.UInteger;
+import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.ULong;
+import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.UShort;
+import org.jspecify.annotations.NonNull;
+import org.jspecify.annotations.Nullable;
+
+final class FloatConversions {
+
+  /** 2^63: the smallest positive double an Int64 cannot hold; (double) Long.MAX_VALUE is this. */
+  private static final double INT64_BOUND = 9223372036854775808d;
+
+  /** 2^64: the smallest positive double a UInt64 cannot hold. */
+  private static final double UINT64_BOUND = 18446744073709551616d;
+
+  private FloatConversions() {}
+
+  @NonNull
+  static Boolean floatToBoolean(@NonNull Float f) {
+    return f != 0.0f;
+  }
+
+  @Nullable
+  static UByte floatToByte(@NonNull Float f) {
+    long rounded = Math.round(f);
+
+    if (rounded >= 0 && rounded <= UByte.MAX_VALUE) {
+      return ubyte(rounded);
+    } else {
+      return null;
+    }
+  }
+
+  @NonNull
+  static Double floatToDouble(@NonNull Float f) {
+    return f.doubleValue();
+  }
+
+  @Nullable
+  static Short floatToInt16(@NonNull Float f) {
+    long rounded = Math.round(f);
+
+    if (rounded >= Short.MIN_VALUE && rounded <= Short.MAX_VALUE) {
+      return (short) rounded;
+    } else {
+      return null;
+    }
+  }
+
+  @Nullable
+  static Integer floatToInt32(@NonNull Float f) {
+    long rounded = Math.round((double) f);
+
+    if (rounded >= Integer.MIN_VALUE && rounded <= Integer.MAX_VALUE) {
+      return (int) rounded;
+    } else {
+      return null;
+    }
+  }
+
+  @Nullable
+  static Long floatToInt64(@NonNull Float f) {
+    double d = f;
+
+    if (d >= -INT64_BOUND && d < INT64_BOUND) {
+      return Math.round(d);
+    } else {
+      return null;
+    }
+  }
+
+  @Nullable
+  static Byte floatToSByte(@NonNull Float f) {
+    long rounded = Math.round(f);
+
+    if (rounded >= Byte.MIN_VALUE && rounded <= Byte.MAX_VALUE) {
+      return (byte) rounded;
+    } else {
+      return null;
+    }
+  }
+
+  @NonNull
+  static String floatToString(@NonNull Float f) {
+    return f.toString();
+  }
+
+  @Nullable
+  static UShort floatToUInt16(@NonNull Float f) {
+    long rounded = Math.round(f);
+
+    if (rounded >= UShort.MIN_VALUE && rounded <= UShort.MAX_VALUE) {
+      return ushort((int) rounded);
+    } else {
+      return null;
+    }
+  }
+
+  @Nullable
+  static UInteger floatToUInt32(@NonNull Float f) {
+    long rounded = Math.round((double) f);
+
+    if (rounded >= UInteger.MIN_VALUE && rounded <= UInteger.MAX_VALUE) {
+      return uint(rounded);
+    } else {
+      return null;
+    }
+  }
+
+  @Nullable
+  static ULong floatToUInt64(@NonNull Float f) {
+    double d = f;
+
+    // Math.round() takes [-0.5, 0) to 0, so those values fit, as they do for the other unsigned
+    // types. NaN fails both comparisons.
+    if (d >= -0.5 && d < UINT64_BOUND) {
+      // Math.round() saturates at Long.MAX_VALUE, so the top half of the UInt64 range has to wrap.
+      // Every double in [2^63, 2^64) is a whole multiple of 2^11, so d - UINT64_BOUND is exact and
+      // its low 64 bits are the UInt64 value.
+      long bits = d < INT64_BOUND ? Math.round(d) : (long) (d - UINT64_BOUND);
+
+      return ulong(bits);
+    } else {
+      return null;
+    }
+  }
+
+  @Nullable
+  static Object convert(@Nullable Object o, OpcUaDataType targetType, boolean implicit) {
+    if (o instanceof Float f) {
+      return implicit ? implicitConversion(f, targetType) : explicitConversion(f, targetType);
+    } else {
+      return null;
+    }
+  }
+
+  @Nullable
+  static Object explicitConversion(@NonNull Float f, OpcUaDataType targetType) {
+    return switch (targetType) {
+      case Boolean -> floatToBoolean(f);
+      case Byte -> floatToByte(f);
+      case Int16 -> floatToInt16(f);
+      case Int32 -> floatToInt32(f);
+      case Int64 -> floatToInt64(f);
+      case SByte -> floatToSByte(f);
+      case String -> floatToString(f);
+      case UInt16 -> floatToUInt16(f);
+      case UInt32 -> floatToUInt32(f);
+      case UInt64 -> floatToUInt64(f);
+      default -> implicitConversion(f, targetType);
+    };
+  }
+
+  @Nullable
+  static Object implicitConversion(@NonNull Float f, OpcUaDataType targetType) {
+    return switch (targetType) {
+      case Double -> floatToDouble(f);
+      default -> null;
+    };
+  }
+}
